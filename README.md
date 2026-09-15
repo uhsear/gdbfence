@@ -1,0 +1,195 @@
+# gdbfence
+
+Refuse the commit that puts a File Geodatabase, a shapefile missing its .prj, or a drive letter into git. Names what already bloats the history and prints the filter-repo command.
+
+Someone runs `git add data/`. Inside `parcels.gdb` are 340 files and the largest is 411 kB, so
+pre-commit's `check-added-large-files` passes every one of them against its 500 kB per-file
+default. 140 MB of unmergeable binary lands on main and the clone takes eleven minutes a year
+later. Nobody notices on the day, because nothing failed.
+
+Three commits earlier, somebody staged `roads.shp`, `roads.shx` and `roads.dbf` but not
+`roads.prj`. A shapefile with no `.prj` carries no CRS at all, so every checkout of it lands
+wherever the reader guesses. In ArcGIS Pro that is usually the Gulf of Mexico.
+
+```
+$ python gdbfence.py --self-test
+gdbfence self-test: no git, no disk, no network
+--------------------------------------------------------------------
+PASS  a file under a .gdb belongs to that .gdb
+PASS  the outermost container wins over a nested one
+PASS  a path with spaces in it groups like any other
+PASS  parcels.gdb.zip is ONE FILE, never walked as a directory  <-- pinned defect
+PASS  the zip forms a single one-file dataset  <-- pinned defect
+PASS  the zip is not reported as a geodatabase  <-- pinned defect
+PASS  340 files under one .gdb group into ONE dataset
+PASS  340 files of 411 kB is ONE 139.7 MB dataset, not 340 small files
+PASS  every one of those 411 kB files passes the 500 kB per-file rule
+PASS  the 139.7 MB dataset is refused while all 340 files pass check-added-large-files
+PASS  the finding names the .gdb, not one of its 340 files
+...
+PASS  a shapefile's size is the sum of its sidecars
+PASS  an uppercase but complete shapefile set produces nothing
+PASS  --ignore folds case the same way on every platform  <-- pinned defect
+PASS  a CIM document with an absolute user path is non-portable
+PASS  the same CIM document with a relative path is fine  <-- pinned defect
+PASS  an escaped relative path is not a UNC share  <-- pinned defect
+PASS  a path with a space is quoted into ONE argument  <-- pinned defect
+PASS  an incomplete shapefile is NOT offered to filter-repo, you add the .prj
+...
+PASS  a path that does not exist is a usage error, not a clean pass  <-- pinned defect
+PASS  the pre-commit entry needs no install step
+--------------------------------------------------------------------
+108 assertions, 0 failed
+```
+
+## Requirements
+
+Python 3.9 or newer. Nothing to install, no `arcpy`, no third-party package. It runs on ArcGIS
+Pro's Python and on a plain `python3` equally.
+
+`git` is needed only for `--staged`, for `--install`, and for the read-only history check that
+prints the filter-repo command. Auditing paths on disk needs no repository at all.
+
+```
+git clone https://github.com/uhsear/gdbfence.git
+```
+
+## Quick start
+
+```
+python gdbfence.py --self-test
+python gdbfence.py data/
+```
+
+## Usage
+
+Audit paths on disk, or audit what git has staged.
+
+```
+python gdbfence.py data/ layers/
+python gdbfence.py --staged
+python gdbfence.py --staged --ignore 'vendor/*' --max-dataset-size 25MB
+```
+
+`--staged` reads the index and never the working tree, for the sizes and for the document text
+alike. Staging a `.lyrx` with a drive letter in it and then fixing the file on disk does not get
+past the hook, because the hook reads what git is about to commit.
+
+Install it as a hook. Nothing is written without `--apply`.
+
+```
+python gdbfence.py --install            # prints both forms, writes nothing
+python gdbfence.py --install --apply    # writes .git/hooks/pre-commit
+```
+
+`--install` also prints a `.pre-commit-config.yaml` entry, so a repository that already uses
+pre-commit can run this alongside `check-added-large-files` rather than instead of it.
+
+| Flag | Default | What it does |
+|---|---|---|
+| `PATHS` | none | Files or directories to audit. Directories are walked. A path that does not exist is a usage error, not a clean audit. |
+| `--staged` | off | Audit git's staged file list instead of `PATHS`. |
+| `--max-dataset-size` | `10MB` | Largest allowed total for ONE dataset. Env: `GDBFENCE_MAX_DATASET_SIZE` |
+| `--ignore` | none | Skip paths matching this glob. Repeatable. |
+| `--no-history` | off | Skip the read-only git check that prints the filter-repo command. |
+| `--install` | off | Print the hook forms and write `.git/hooks/pre-commit`. |
+| `--apply` | off | Write the hook file. Without it nothing is written. |
+| `--self-test` | off | Run the offline assertions and exit. |
+
+Exit codes: 0 clean, 1 findings, 2 a git or install step failed, 64 usage error.
+
+## What it refuses
+
+- **A dataset over the size limit.** A `.gdb` directory is one dataset whose size is the sum of
+  its parts, and so is a shapefile's sidecar set. The report gives the dataset total and, when the
+  largest single file is itself under the per-file limit, names the rule that file passed.
+- **An incomplete shapefile.** A `.shp` staged without `.shx`, `.dbf` or `.prj`. The report names
+  the missing extensions and says what a missing `.prj` costs.
+- **A non-portable path** inside a text or CIM document: an absolute drive letter such as
+  `C:\GIS\parcels.gdb`, or a UNC path such as `\\gisfiles\parcels`. It reads `.lyrx`, `.mapx`,
+  `.json`, `.py`, `.pyt`, `.yml`, `.xml`, `.sql` and a few more, and gives the line number.
+- **Files that should essentially never be committed**: `.gdb`, `.sde`, `.lock`, `.mdb` and
+  `.gdbindexes`.
+
+When a refused dataset is already in a commit, it prints the exact `git filter-repo` command that
+removes it, with any path that is not plainly safe double quoted so that a path with a space in it
+stays one argument. It prints the command and stops. That command rewrites every hash and forces
+every collaborator to re-clone, so the person who owns that decision is the person reading the
+output.
+
+Only bloat and never-commit findings are offered to filter-repo. A shapefile missing its `.prj`
+is fixed by committing the `.prj`, and a hard-coded drive letter is fixed by editing the line.
+Offering to rewrite history for either one is the wrong remedy aimed at a real problem.
+
+## Why not just use check-added-large-files
+
+Use it. It is healthy, maintained, and it catches the single 80 MB GeoTIFF that this tool also
+catches. It is not competing with this one.
+
+It is the wrong shape for GIS, and the shape is the whole problem. It measures one file at a
+time, at 500 kB, and it has no concept of a directory that is one dataset. 340 files of 411 kB
+are 340 passes and one 140 MB repository:
+
+```
+$ python gdbfence.py data --no-history
+gdbfence: 343 file(s) from 1 path(s) on the command line
+
+  NEVER_COMMIT  data/parcels.gdb
+      a geodatabase directory (340 file(s) here) is binary and unmergeable, keep it out of git entirely
+  BIG_DATASET  data/parcels.gdb
+      one dataset of 340 file(s) totalling 139.7 MB, over the 10.0 MB limit, and its largest single file is 411.0 kB, under the 512.0 kB per-file rule
+  INCOMPLETE_SHAPEFILE  data/roads.shp
+      incomplete shapefile, missing .prj. Without .prj it carries no CRS and the reader guesses
+VERDICT: REFUSE
+```
+
+It has no concept of a sidecar set either, so a shapefile missing its `.prj` is three perfectly
+acceptable small files. The missing file is the defect, and a per-file check can only ever look
+at files that are present.
+
+The naive version of this tool has its own trap, and the self-test pins it. A substring test for
+`.gdb` turns `archive/parcels.gdb.zip` into a directory that is never walked and a dataset that
+is never reported. Only ancestor path components are tested for a container suffix, and three
+assertions hold that line.
+
+The UNC check had the same shape of bug, found by running it. A CIM document spells a relative
+path `"..\\data\\parcels.gdb"`, which contains `\\data\`, so the first pattern reported every
+portable layer file in the repository as non-portable. A UNC path now only counts at the start of
+a path, and two more assertions pin it.
+
+Credential scanning is deliberately absent. `gitleaks` and `detect-secrets` do that properly, and
+an `.sde` file with a saved password is caught here as an `.sde` file, not as a secret.
+
+## Limits
+
+- It does not know a comment from code. A drive letter written in a comment or a docstring is
+  still reported. Use `--ignore` for the file, or move the example path into a string the tool
+  does not read.
+- Size only, not content. It has no opinion about whether 9 MB of geodatabase is worth committing,
+  only that 11 MB is over the limit.
+- `--ignore` is `fnmatch`, not `.gitignore` syntax. `vendor/*` and `*.tif` work. Negation and `**`
+  do not. It ignores case on every platform, so `vendor/*` also skips `VENDOR/roads.shp`.
+- It never runs `git filter-repo`, and it never stages, unstages or deletes anything. `--apply`
+  writes one file, the pre-commit hook, and refuses to overwrite a hook that already exists.
+- The hook it writes calls `python gdbfence.py --staged` from the repository root, so keep a copy
+  of the file there, or edit the one line in `.git/hooks/pre-commit`.
+- A `.gdb` big enough to matter is usually already ignored. This tool is for the repository where
+  that was never set up, and for the moment somebody adds a new data directory to one where it was.
+- It reads sizes and document text from the git index under `--staged`, so a file that is staged
+  but not yet written to disk is measured and read correctly. Auditing `PATHS` reads the working
+  tree instead, which is the right answer for that question and a different one.
+- A shapefile whose sidecars disagree about the case of the name, `ROADS.SHP` beside `roads.prj`,
+  is counted as two datasets and reported incomplete. Extensions are matched without regard to
+  case; the name before the extension is not.
+
+## Contributing
+
+Open an issue or pull request on GitHub.
+
+## Author
+
+Built by [Asir Khan](https://www.linkedin.com/in/asir-khan-310317264/).
+
+## License
+
+MIT.
