@@ -39,7 +39,7 @@ PASS  an incomplete shapefile is NOT offered to filter-repo, you add the .prj
 PASS  a path that does not exist is a usage error, not a clean pass  <-- pinned defect
 PASS  the pre-commit entry needs no install step
 --------------------------------------------------------------------
-108 assertions, 0 failed
+119 assertions, 0 failed
 ```
 
 ## Requirements
@@ -159,6 +159,21 @@ a path, and two more assertions pin it.
 
 Credential scanning is deliberately absent. `gitleaks` and `detect-secrets` do that properly, and
 an `.sde` file with a saved password is caught here as an `.sde` file, not as a secret.
+
+## Waiving a line
+
+A file that must carry an example path says so on that line:
+
+```python
+ws = "C:/gis/staging"  # gdbfence: allow
+```
+
+The waiver is read from the original line, before comments are stripped, and it
+applies only to the line it sits on. gdbfence uses it on its own test fixtures,
+and scans its own source clean.
+
+In Python and .pyt files, comments and docstrings are not scanned at all. A
+drive letter in prose is documentation. One in an assignment is the defect.
 
 ## Limits
 

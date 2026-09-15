@@ -32,6 +32,7 @@ import argparse
 import fnmatch
 import io
 import os
+import tokenize
 import re
 import subprocess
 import sys
@@ -75,7 +76,7 @@ TEXT_SUFFIXES = (".lyrx", ".mapx", ".json", ".py", ".pyt", ".txt", ".md",
                  ".yml", ".yaml", ".xml", ".sql", ".cfg", ".ini", ".bat")
 
 # Nothing larger than this is read for text scanning. A 200 MB "json" is not a
-# document, and reading it to look for C:\ helps nobody.
+# document, and reading it to look for C:\ helps nobody.  # gdbfence: allow
 TEXT_READ_LIMIT = 4 * 1000 * 1000
 
 # =============================================================================
@@ -94,22 +95,27 @@ NON_PORTABLE_PATH = "NON_PORTABLE_PATH"
 # either one is the wrong remedy pointed at a real problem.
 REMOVABLE = (BIG_DATASET, NEVER_COMMIT_CODE)
 
-# An absolute drive letter: C:\Users or C:/Users, escaped or not. The word
+# An absolute drive letter: C:\Users or C:/Users, escaped or not. The word  # gdbfence: allow
 # boundary keeps https:// and the like out of it.
 DRIVE_RE = re.compile(r"\b[A-Za-z]:[\\/]")
 
-# A UNC share. Written \\gisfiles\parcels in a .py and \\\\gisfiles\\\\parcels
+# An inline waiver. A line carrying this marker is skipped by the content
+# rules, so a file that must carry an example path can say so. This tool's
+# own self-test fixtures need it, which is the honest test of the feature.
+ALLOW_RE = re.compile(r"gdbfence:\s*allow")
+
+# A UNC share. Written \\gisfiles\parcels in a .py and \\\\gisfiles\\\\parcels  # gdbfence: allow
 # once JSON has escaped it, so the pattern has to survive both spellings.
 #
 # The leading group is the guard: a UNC path only counts at the START of a
 # path, after a quote, an equals sign or whitespace. Without it, the CIM
-# spelling of a RELATIVE path, "..\\data\\parcels.gdb", contains \\data\ and
+# spelling of a RELATIVE path, "..\\data\\parcels.gdb", contains \\data\ and  # gdbfence: allow
 # every portable layer file in the repository is reported as non-portable.
 UNC_RE = re.compile(r"""(?:^|[\s"'=(\[,:])(\\{2,4}[A-Za-z0-9._$-]+\\)""")
 
 # A path made only of these characters needs no quoting in the printed
 # filter-repo command. Anything else is double quoted. GIS paths have spaces in
-# them as a matter of routine, and an unquoted --path C:/GIS Data/parcels.gdb is
+# them as a matter of routine, and an unquoted --path C:/GIS Data/parcels.gdb is  # gdbfence: allow
 # two arguments, neither of which filter-repo would ever find.
 SAFE_PATH_RE = re.compile(r"^[A-Za-z0-9._/@=+-]+$")
 
@@ -294,14 +300,69 @@ def audit(entries, max_dataset_size=DEFAULT_MAX_DATASET_SIZE, ignore=(),
     return findings
 
 
+def strip_python_prose(text):
+    """Blank comments and docstrings in Python source, keeping every offset.
+
+    A drive letter in "ws = C:/gis/staging" is the defect this tool exists to  # gdbfence: allow
+    catch. The same characters inside a comment explaining that defect are
+    documentation, and flagging them makes the hook noisy enough to uninstall.
+    gdbfence flagged its own source this way, twice, from two of its comments.
+
+    Only the comment and docstring SPANS are replaced, with spaces, so a line
+    holding both code and a trailing comment keeps its code. Blanking whole
+    lines instead hid a real hardcoded path that shared a line with a comment.
+    """
+    try:
+        tokens = list(tokenize.generate_tokens(io.StringIO(text).readline))
+    except (tokenize.TokenError, IndentationError, SyntaxError):
+        # Not parseable as Python. Scan it raw rather than skipping it entirely.
+        return text
+
+    lines = text.split(chr(10))
+    prev = None
+    spans = []
+    for kind, _text, start_pos, end_pos, _line in tokens:
+        drop = False
+        if kind == tokenize.COMMENT:
+            drop = True
+        elif kind == tokenize.STRING:
+            # A docstring stands alone as a statement, so what precedes it opens
+            # a logical line instead of continuing one.
+            if prev in (None, tokenize.INDENT, tokenize.DEDENT,
+                        tokenize.NEWLINE, tokenize.NL):
+                drop = True
+        if drop:
+            spans.append((start_pos, end_pos))
+        if kind not in (tokenize.NL, tokenize.COMMENT):
+            prev = kind
+
+    for (srow, scol), (erow, ecol) in spans:
+        for row in range(srow, erow + 1):
+            if row - 1 >= len(lines):
+                break
+            line = lines[row - 1]
+            begin = scol if row == srow else 0
+            finish = ecol if row == erow else len(line)
+            lines[row - 1] = line[:begin] + " " * (finish - begin) + line[finish:]
+    return chr(10).join(lines)
+
+
 def scan_text(path, text):
     """Findings for the CONTENT of one text or CIM document.
 
     Kept apart from audit() so the size and completeness rules never need a file
     to be readable, and so this one is testable against a string literal.
     """
+    original = text.splitlines()
+    if path.lower().endswith((".py", ".pyt")):
+        text = strip_python_prose(text)
     findings = []
     for line_no, line in enumerate(text.splitlines(), 1):
+        # The waiver is read from the ORIGINAL line. The stripper has already
+        # erased the comment carrying it by this point, so checking the stripped
+        # line finds nothing and the waiver silently does not work.
+        if line_no <= len(original) and ALLOW_RE.search(original[line_no - 1]):
+            continue
         m = DRIVE_RE.search(line)
         if m:
             findings.append(Finding(
@@ -687,7 +748,7 @@ def self_test():
 
     # ---- non-portable paths in text and CIM documents
     cim = ('{"dataConnection": {"workspaceConnectionString": '
-           '"DATABASE=C:\\\\GIS\\\\parcels.gdb"}}')
+           '"DATABASE=C:\\\\GIS\\\\parcels.gdb"}}')  # gdbfence: allow
     f = scan_text("parcels.lyrx", cim)
     check(codes(f) == [NON_PORTABLE_PATH],
           "a CIM document with an absolute user path is non-portable")
@@ -698,10 +759,10 @@ def self_test():
           "the same CIM document with a relative path is fine  <-- pinned defect")
     check(scan_text("etl.py", 'p = "..\\\\data\\\\roads.shp"') == [],
           "an escaped relative path is not a UNC share  <-- pinned defect")
-    check(codes(scan_text("etl.py", 'ws = r"D:/gis/staging"'))
+    check(codes(scan_text("etl.py", 'ws = r"D:/gis/staging"'))  # gdbfence: allow
           == [NON_PORTABLE_PATH],
           "a forward slash drive letter is caught too")
-    check(codes(scan_text("etl.py", 'ws = r"\\\\gisfiles\\parcels\\current"'))
+    check(codes(scan_text("etl.py", 'ws = r"\\\\gisfiles\\parcels\\current"'))  # gdbfence: allow
           == [NON_PORTABLE_PATH],
           "a UNC share path is non-portable")
     check(codes(scan_text("etl.py", '{"p": "\\\\\\\\gisfiles\\\\\\\\parcels"}'))
@@ -711,8 +772,38 @@ def self_test():
           "a URL is not a drive letter")
     check(scan_text("etl.py", 'ws = "./data/parcels.gdb"') == [],
           "a relative workspace is fine")
-    check(len(scan_text("a.py", 'x = "C:/a"\ny = 1\nz = "E:/b"')) == 2,
+    check(len(scan_text("a.py", 'x = "C:/a"\ny = 1\nz = "E:/b"')) == 2,  # gdbfence: allow
           "every offending line is reported, not just the first")
+
+    # ---- prose in python source is documentation, not a hardcoded path
+    check(scan_text("a.py", "# look for C:" + chr(92) + " helps nobody") == [],
+          "a drive letter inside a python comment is not flagged  <-- pinned defect")
+    check(scan_text("a.py", '"""A docstring naming C:/Users/jdoe."""') == [],  # gdbfence: allow
+          "a drive letter inside a module docstring is not flagged")
+    check(codes(scan_text("a.py", 'ws = "C:/gis/staging"  # the real defect'))  # gdbfence: allow
+          == [NON_PORTABLE_PATH],
+          "a drive letter in an assignment is still flagged next to a comment")
+    check(codes(scan_text("a.py", 'def f():' + chr(10) + '    """doc C:/x"""'  # gdbfence: allow
+                          + chr(10) + '    p = "D:/y"')) == [NON_PORTABLE_PATH],  # gdbfence: allow
+          "a function docstring is skipped while its body is still scanned")
+    check(scan_text("a.py", "x = (") == [],
+          "unparseable python does not raise")
+    check(codes(scan_text("a.py", 'x = (' + chr(10) + 'ws = "C:/gis"'))  # gdbfence: allow
+          == [NON_PORTABLE_PATH],
+          "unparseable python falls back to a raw scan")
+    check(codes(scan_text("notes.md", "see C:/Users/jdoe")) == [NON_PORTABLE_PATH],  # gdbfence: allow
+          "a non-python file is not prose-stripped")
+
+    # ---- the inline waiver
+    check(codes(scan_text("a.py", 'ws = "C:/gis"')) == [NON_PORTABLE_PATH],  # gdbfence: allow
+          "a hardcoded workspace is flagged without a waiver")
+    check(scan_text("a.py", 'ws = "C:/gis"  # gdbfence: allow') == [],
+          "the waiver is read from the original line, not the stripped one  <-- pinned defect")
+    check(scan_text("notes.md", "see C:/Users/x  gdbfence: allow") == [],
+          "the waiver works in a non-python file too")
+    check(codes(scan_text("a.py", 'a = "C:/x"' + chr(10) + 'b = "D:/y"  # gdbfence: allow'))
+          == [NON_PORTABLE_PATH],
+          "the waiver applies only to its own line")
 
     # ---- sizes in and out
     check(parse_size("10MB") == 10000000, "10MB parses to ten million bytes")
@@ -745,7 +836,7 @@ def self_test():
           "a bloated .gdb is offered to filter-repo once, not 340 times")
     check(removable_paths(audit(part)) == [],
           "an incomplete shapefile is NOT offered to filter-repo, you add the .prj")
-    check(removable_paths(scan_text("a.lyrx", 'p = "C:/gis"')) == [],
+    check(removable_paths(scan_text("a.lyrx", 'p = "C:/gis"')) == [],  # gdbfence: allow
           "a hard-coded drive letter is NOT offered to filter-repo, you edit the line")
 
     # ---- input validation
