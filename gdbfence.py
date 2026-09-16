@@ -23,7 +23,8 @@ and detect-secrets, which do it properly.
     python gdbfence.py data/ layers/
     python gdbfence.py --install --apply
 
-Exit codes: 0 clean, 1 findings, 2 a git or install step failed, 64 usage error.
+Exit codes: 0 clean, 1 findings, 2 a git step, an install step or a flag value failed,
+64 usage error.
 """
 
 from __future__ import print_function
@@ -34,8 +35,10 @@ import io
 import os
 import tokenize
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 
 # =============================================================================
 # CONFIGURATION. Deliberately not flags. Change here, not at the call site.
@@ -301,22 +304,32 @@ def audit(entries, max_dataset_size=DEFAULT_MAX_DATASET_SIZE, ignore=(),
 
 
 def strip_python_prose(text):
-    """Blank comments and docstrings in Python source, keeping every offset.
+    """Split Python source into (code, prose), each keeping every offset.
 
     A drive letter in "ws = C:/gis/staging" is the defect this tool exists to  # gdbfence: allow
     catch. The same characters inside a comment explaining that defect are
     documentation, and flagging them makes the hook noisy enough to uninstall.
     gdbfence flagged its own source this way, twice, from two of its comments.
 
-    Only the comment and docstring SPANS are replaced, with spaces, so a line
-    holding both code and a trailing comment keeps its code. Blanking whole
-    lines instead hid a real hardcoded path that shared a line with a comment.
+    Two views of the same text come back, both the same shape as the input:
+    "code" with the comment and docstring SPANS blanked, and "prose" with
+    everything else blanked. Only the spans are replaced, with spaces, so a line
+    holding both code and a trailing comment keeps its code in one view and its
+    comment in the other. Blanking whole lines instead hid a real hardcoded path
+    that shared a line with a comment.
+
+    The prose view exists so the waiver can be read from the comment ALONE. Read
+    from the raw line, "gdbfence: allow" written inside a string literal waived
+    the real hardcoded path sitting next to it on that line.
+
+    Text that does not parse as Python comes back as itself twice, so the raw
+    fallback scan still sees a waiver written anywhere on the line.
     """
     try:
         tokens = list(tokenize.generate_tokens(io.StringIO(text).readline))
     except (tokenize.TokenError, IndentationError, SyntaxError):
         # Not parseable as Python. Scan it raw rather than skipping it entirely.
-        return text
+        return text, text
 
     lines = text.split(chr(10))
     prev = None
@@ -336,6 +349,8 @@ def strip_python_prose(text):
         if kind not in (tokenize.NL, tokenize.COMMENT):
             prev = kind
 
+    code = list(lines)
+    prose = [" " * len(line) for line in lines]
     for (srow, scol), (erow, ecol) in spans:
         for row in range(srow, erow + 1):
             if row - 1 >= len(lines):
@@ -343,8 +358,13 @@ def strip_python_prose(text):
             line = lines[row - 1]
             begin = scol if row == srow else 0
             finish = ecol if row == erow else len(line)
-            lines[row - 1] = line[:begin] + " " * (finish - begin) + line[finish:]
-    return chr(10).join(lines)
+            # Blanking preserves length, so the offsets of a later span on the
+            # same line are still right after an earlier one has been applied.
+            code[row - 1] = (code[row - 1][:begin] + " " * (finish - begin)
+                             + code[row - 1][finish:])
+            prose[row - 1] = (prose[row - 1][:begin] + line[begin:finish]
+                              + prose[row - 1][finish:])
+    return chr(10).join(code), chr(10).join(prose)
 
 
 def scan_text(path, text):
@@ -353,15 +373,21 @@ def scan_text(path, text):
     Kept apart from audit() so the size and completeness rules never need a file
     to be readable, and so this one is testable against a string literal.
     """
-    original = text.splitlines()
+    waiver_lines = text.splitlines()
     if path.lower().endswith((".py", ".pyt")):
-        text = strip_python_prose(text)
+        text, prose = strip_python_prose(text)
+        waiver_lines = prose.splitlines()
     findings = []
     for line_no, line in enumerate(text.splitlines(), 1):
-        # The waiver is read from the ORIGINAL line. The stripper has already
-        # erased the comment carrying it by this point, so checking the stripped
-        # line finds nothing and the waiver silently does not work.
-        if line_no <= len(original) and ALLOW_RE.search(original[line_no - 1]):
+        # The waiver is NOT read from the line being scanned. The stripper has
+        # already erased the comment carrying it by this point, so checking the
+        # stripped line finds nothing and the waiver silently does not work.
+        # In Python it is read from the comments and docstrings only, so that a
+        # string literal holding the marker cannot waive the code beside it. In
+        # anything else there is no comment syntax to trust, so the raw line is
+        # the only thing there is to read.
+        if line_no <= len(waiver_lines) and ALLOW_RE.search(
+                waiver_lines[line_no - 1]):
             continue
         m = DRIVE_RE.search(line)
         if m:
@@ -415,22 +441,45 @@ def filter_repo_command(paths):
     return "git filter-repo --invert-paths --force %s" % args
 
 
-def hook_script(tool_path):
+def hook_interpreter(executable=None):
+    """The interpreter the generated hook should call.
+
+    "python" is not a command on a stock Ubuntu, which ships python3 and no
+    unversioned alias. A hook heading "exec python" therefore fails to start,
+    git reports the non-zero exit as a refusal, and that refusal looks like
+    gdbfence blocking the commit when nothing was ever scanned. A clean commit
+    is blocked the same way. The interpreter that ran --install is the one
+    interpreter known to exist, so the hook names it.
+    """
+    exe = executable if executable is not None else sys.executable
+    return exe or "python3"
+
+
+def sh_quote(text):
+    """Single-quote a string for /bin/sh. An interpreter path carries spaces."""
+    return "'" + text.replace("'", "'" + chr(92) + "''") + "'"
+
+
+def hook_script(tool_path, executable=None):
     """The plain git pre-commit hook, as text."""
-    return ("#!/bin/sh\n"
-            "# Installed by gdbfence --install. Delete this file to remove it.\n"
-            "exec python %s --staged\n" % tool_path)
+    return ("#!/bin/sh" + chr(10)
+            + "# Installed by gdbfence --install. Delete this file to remove it."
+            + chr(10)
+            + "exec %s %s --staged" % (sh_quote(hook_interpreter(executable)),
+                                       sh_quote(tool_path))
+            + chr(10))
 
 
-def precommit_entry(tool_path):
+def precommit_entry(tool_path, executable=None):
     """The .pre-commit-config.yaml block, as text."""
-    return ("-   repo: local\n"
-            "    hooks:\n"
-            "    -   id: gdbfence\n"
-            "        name: gdbfence\n"
-            "        entry: python %s --staged\n"
-            "        language: system\n"
-            "        pass_filenames: false\n" % tool_path)
+    return ("-   repo: local" + chr(10)
+            + "    hooks:" + chr(10)
+            + "    -   id: gdbfence" + chr(10)
+            + "        name: gdbfence" + chr(10)
+            + "        entry: %s %s --staged" % (hook_interpreter(executable),
+                                                 tool_path) + chr(10)
+            + "        language: system" + chr(10)
+            + "        pass_filenames: false" + chr(10))
 
 
 def describe(findings):
@@ -561,8 +610,13 @@ def install(tool_path, apply_it):
     try:
         if not os.path.isdir(hook_dir):
             os.makedirs(hook_dir)
-        with open(hook, "w") as fh:
-            fh.write(hook_script(tool_path))
+        # Binary, so the file on disk is byte for byte the text printed above.
+        # Text mode turns every newline into CRLF on Windows, and a /bin/sh
+        # hook whose last line ends "--staged\r" passes a flag no argument
+        # parser accepts. Git for Windows tolerates it; dash and busybox, which
+        # is what the same repository meets in WSL or in a container, do not.
+        with open(hook, "wb") as fh:
+            fh.write(hook_script(tool_path).encode("utf-8"))
         os.chmod(hook, 0o755)
     except (OSError, IOError) as exc:
         print("error: could not write %s: %s" % (hook, exc), file=sys.stderr)
@@ -576,7 +630,13 @@ def install(tool_path, apply_it):
 # ------------------------------------------------------------------ self-test
 
 def self_test():
-    """Assertions over the decision core. No git, no disk, no network."""
+    """Assertions over the decision core, then over the io layer.
+
+    Nothing here reaches the network, and nothing here touches the repository it
+    is run from. The io half writes to a temporary directory and drives git
+    inside it, because the hook, the read from the index and the printed
+    filter-repo remedy cannot be tested any other way.
+    """
     passed = [0]
     failed = []
 
@@ -601,7 +661,7 @@ def self_test():
     def codes(findings):
         return [f.code for f in findings]
 
-    print("gdbfence self-test: no git, no disk, no network")
+    print("gdbfence self-test: no network, a temporary git repo for the io layer")
     print("-" * 68)
 
     # ---- the classifier
@@ -619,6 +679,10 @@ def self_test():
           "roads.shp.xml groups with roads, not with a dataset called roads.shp")
     check(dataset_of("notes.md") == ("notes.md", "file"),
           "an ordinary file is its own dataset")
+    check(normalize("./data/roads.shp") == "data/roads.shp",
+          "a leading ./ is dropped, so git's spelling and the walker's agree")
+    check(normalize("././data/") == "data",
+          "a repeated ./ is dropped and a trailing slash with it")
     check(dataset_of("data\\parcels.gdb\\a.gdbtable")[0] == "data/parcels.gdb",
           "a windows path is read the same as a git path")
     check(dataset_of("DATA/PARCELS.GDB/A.GDBTABLE")[0] == "DATA/PARCELS.GDB",
@@ -638,6 +702,24 @@ def self_test():
     check(NEVER_COMMIT_CODE not in codes(f),
           "the zip is not reported as a geodatabase  <-- pinned defect")
     check(BIG_DATASET in codes(f), "the zip is still reported for its own size")
+    # The rule has two halves and each one needs its own assertion. The slice
+    # is the first half: ONLY ancestors are tested, so a plain file that is
+    # itself named .gdb is a file. Dropping the slice keeps the same dataset
+    # key and changes only the kind, so nothing above this line goes red.
+    check(dataset_of("data/parcels.gdb") == ("data/parcels.gdb", "file"),
+          "a plain file named .gdb is a FILE, not a directory of 1  <-- pinned defect")
+    check(audit([("data/parcels.gdb", 10)])[0].message
+          == ".gdb files should never be committed",
+          "so it is refused as a file, not described as a directory of files")
+    # endswith is the second half. A directory whose name merely CONTAINS
+    # .gdb is not a geodatabase, and a substring test would swallow everything
+    # under it into one dataset named after a directory git has no such path
+    # for, which is a filter-repo command that removes nothing.
+    check(dataset_of("archive.gdb.backup/notes.txt")
+          == ("archive.gdb.backup/notes.txt", "file"),
+          "a directory whose name merely CONTAINS .gdb is not a container  <-- pinned defect")
+    check(codes(audit([("archive.gdb.backup/a.bin", 50000000)])) == [BIG_DATASET],
+          "so its contents are not refused as a geodatabase")
 
     # ---- the headline: dataset-shaped size against per-file size
     gdb = [("data/parcels.gdb/a%08d.gdbtable" % i, 411000) for i in range(340)]
@@ -677,6 +759,15 @@ def self_test():
     check("per-file rule" not in f[0].message,
           "a file that is ITSELF over the per-file limit is never described as "
           "passing it  <-- pinned defect")
+    # The boundary between those two messages. A file of exactly 512.0 kB is
+    # what check-added-large-files ALLOWS, so this is the case the note exists
+    # to describe, and a strict comparison here would drop it in silence.
+    edge = audit([("data/edge.gdb/a%d.gdbtable" % i, PER_FILE_LIMIT)
+                  for i in range(30)])
+    edge = [x for x in edge if x.code == BIG_DATASET][0]
+    check("under the 512.0 kB per-file rule" in edge.message,
+          "a largest file of EXACTLY the per-file limit still passed it, so the "
+          "note is still printed  <-- pinned defect")
 
     # ---- the shapefile sidecar set
     part = [("roads.shp", 100), ("roads.shx", 10), ("roads.dbf", 50)]
@@ -735,6 +826,24 @@ def self_test():
           "an uppercase file matches a lowercase glob  <-- pinned defect")
     check(codes(audit([("VENDOR/roads.shp", 1)], ignore=("vendor/*",))) == [],
           "the case-folded ignore reaches audit, not only ignored()")
+    # Both sides are folded, and every assertion above this line writes the
+    # PATTERN in lower case, so they hold only the path side. A person typing
+    # --ignore VENDOR/* on the command line folds the other way.
+    check(ignored("vendor/roads.shp", ["VENDOR/*"]),
+          "an uppercase GLOB matches a lowercase path too  <-- pinned defect")
+    check(codes(audit([("vendor/roads.shp", 1)], ignore=("VENDOR/*",))) == [],
+          "and that direction reaches audit as well")
+    # A pattern with no slash in it is matched against the basename, so
+    # --ignore "*.tif" and --ignore "roads.shp" both work at any depth. The
+    # full-path attempt alone misses the second one, because fnmatch has no
+    # leading wildcard to get past "data/".
+    check(ignored("data/gis/roads.shp", ["roads.shp"]),
+          "a bare filename glob matches that file at any depth")
+    check(ignored("data/gis/roads.shp", ["gis"]),
+          "and a bare directory name ignores everything under it, so --ignore "
+          "vendor needs no trailing glob")
+    check(not ignored("data/gis/roads.shp", ["road"]),
+          "a bare name is matched whole, never as a prefix of a longer one")
 
     # ---- things that should never be committed
     check(codes(audit([("conn.sde", 10)])) == [NEVER_COMMIT_CODE],
@@ -743,6 +852,10 @@ def self_test():
           "a .lock file is refused")
     check(codes(audit([("old/parcels.mdb", 10)])) == [NEVER_COMMIT_CODE],
           "a personal geodatabase .mdb is refused")
+    check(codes(audit([("parcels.gdbindexes", 10)])) == [NEVER_COMMIT_CODE],
+          "a .gdbindexes file is refused")
+    check(codes(audit([("x.gdbindexes/a.bin", 10)])) == [NEVER_COMMIT_CODE],
+          "and so is a .gdbindexes directory, as one dataset")
     check(codes(audit([("notes.txt", 10)])) == [],
           "an ordinary text file is not refused")
 
@@ -797,13 +910,35 @@ def self_test():
     # ---- the inline waiver
     check(codes(scan_text("a.py", 'ws = "C:/gis"')) == [NON_PORTABLE_PATH],  # gdbfence: allow
           "a hardcoded workspace is flagged without a waiver")
-    check(scan_text("a.py", 'ws = "C:/gis"  # gdbfence: allow') == [],
+    check(scan_text("a.py", 'ws = "C:/gis"  # gdbfence: allow') == [],  # gdbfence: allow
           "the waiver is read from the original line, not the stripped one  <-- pinned defect")
-    check(scan_text("notes.md", "see C:/Users/x  gdbfence: allow") == [],
+    check(scan_text("notes.md", "see C:/Users/x  gdbfence: allow") == [],  # gdbfence: allow
           "the waiver works in a non-python file too")
-    check(codes(scan_text("a.py", 'a = "C:/x"' + chr(10) + 'b = "D:/y"  # gdbfence: allow'))
+    check(codes(scan_text("a.py", 'a = "C:/x"' + chr(10)  # gdbfence: allow
+                          + 'b = "D:/y"  # gdbfence: allow'))  # gdbfence: allow
           == [NON_PORTABLE_PATH],
           "the waiver applies only to its own line")
+    # The waiver is a licence to hold a path, so anyone editing the file can
+    # write one. It must not be reachable from data the file merely CONTAINS.
+    check(codes(scan_text("a.py", 'ws = "C:/gis"; note = "gdbfence: allow"'))  # gdbfence: allow
+          == [NON_PORTABLE_PATH],
+          "the marker inside a STRING does not waive the real path beside it  <-- pinned defect")
+    check(codes(scan_text("a.py", 'ws = "C:/gis"  # gdbfence: allow me'))  # gdbfence: allow
+          == [], "the marker in a real comment on that line still waives it")
+    check(codes(scan_text("a.pyt", 'ws = "C:/gis"; n = "gdbfence: allow"'))  # gdbfence: allow
+          == [NON_PORTABLE_PATH],
+          "a .pyt toolbox is prose-stripped and spoof-proof the same way")
+    check(codes(scan_text("a.py", 'x = (' + chr(10)
+                          + 'ws = "C:/gis"; n = "gdbfence: allow"'))  # gdbfence: allow
+          == [], "unparseable python has no comment syntax to trust, so the raw "
+                 "line waives")
+    code_view, prose_view = strip_python_prose('ws = "C:/x"  # why')  # gdbfence: allow
+    check("C:/x" in code_view and "why" not in code_view,  # gdbfence: allow
+          "the code view keeps the code and loses the comment")
+    check("why" in prose_view and "C:/x" not in prose_view,  # gdbfence: allow
+          "the prose view keeps the comment and loses the code")
+    check(len(code_view) == len(prose_view) == len('ws = "C:/x"  # why'),  # gdbfence: allow
+          "both views keep every offset, so line numbers still mean something")
 
     # ---- sizes in and out
     check(parse_size("10MB") == 10000000, "10MB parses to ten million bytes")
@@ -845,16 +980,22 @@ def self_test():
     raises(lambda: audit([("a.tif", None)]), "a null size raises")
     raises(lambda: audit([("a.tif", 1)], max_dataset_size=-1),
            "a negative --max-dataset-size raises")
+    raises(lambda: audit([("a.tif", 1)], per_file_limit=-1),
+           "a negative per-file limit raises")
     raises(lambda: parse_size("ten megabytes"), "an unreadable size raises")
 
     # ---- rendering
     check(describe([])[-1] == "VERDICT: CLEAN", "no findings renders CLEAN")
     check(describe(audit(gdb))[-1] == "VERDICT: REFUSE",
           "findings render REFUSE last")
+    check(repr(Finding(BIG_DATASET, "data/parcels.gdb", "m"))
+          == "Finding(BIG_DATASET, 'data/parcels.gdb')",
+          "a finding reprs as its code and its path")
 
     # ---- argument handling. GDBFENCE_MAX_DATASET_SIZE is taken out of the
     # environment first: it supplies the default for --max-dataset-size, so a
     # developer who exports it once used to see this self-test fail.
+    os.environ["GDBFENCE_MAX_DATASET_SIZE"] = "7MB"
     saved_env = os.environ.pop("GDBFENCE_MAX_DATASET_SIZE", None)
     try:
         a = _parse([])
@@ -882,10 +1023,28 @@ def self_test():
               "GDBFENCE_MAX_DATASET_SIZE is read and parsed  <-- pinned defect")
         check(_parse(["--max-dataset-size", "1MB"]).max_dataset_size == 1000000,
               "the flag beats the environment variable")
+        # argparse runs type= over the default as well, so an unreadable value
+        # exported once is argparse's own usage error and not a traceback out of
+        # a pre-commit hook.
+        os.environ["GDBFENCE_MAX_DATASET_SIZE"] = "ten megabytes"
+        real_stderr, sys.stderr = sys.stderr, io.StringIO()
+        exit_code = None
+        try:
+            try:
+                _parse([])
+            except SystemExit as exc:
+                exit_code = exc.code
+        finally:
+            sys.stderr = real_stderr
+        check(exit_code == 2,
+              "an unreadable GDBFENCE_MAX_DATASET_SIZE exits 2, not a traceback")
     finally:
         os.environ.pop("GDBFENCE_MAX_DATASET_SIZE", None)
         if saved_env is not None:
             os.environ["GDBFENCE_MAX_DATASET_SIZE"] = saved_env
+    check(os.environ.get("GDBFENCE_MAX_DATASET_SIZE") == "7MB",
+          "a developer's own GDBFENCE_MAX_DATASET_SIZE is put back afterwards")
+    os.environ.pop("GDBFENCE_MAX_DATASET_SIZE", None)
 
     # ---- the exit codes, with stderr muted so the report stays readable
     real_stderr, sys.stderr = sys.stderr, io.StringIO()
@@ -898,12 +1057,392 @@ def self_test():
         sys.stderr = real_stderr
 
     # ---- the hook text it would install
+    # ---- the hook must name an interpreter that exists on the host
+    check("exec 'python3' " in hook_script("t.py", executable="python3"),
+          "the hook execs the interpreter it was given")
+    check("exec python " not in hook_script("t.py", executable="python3"),
+          "the hook never execs a bare python, absent on a stock Ubuntu  <-- pinned defect")
+    check(hook_interpreter("") == "python3",
+          "an empty sys.executable falls back to python3, not to python")
+    check(hook_interpreter("/usr/bin/python3.12") == "/usr/bin/python3.12",
+          "an explicit interpreter is used as given")
+    check("'C:" + chr(92) + "Program Files" + chr(92) + "py.exe'"
+          in hook_script("t.py", executable="C:" + chr(92) + "Program Files" + chr(92) + "py.exe"),
+          "an interpreter path holding a space is quoted for /bin/sh")
+    check(sh_quote("it's") == "'it'" + chr(92) + "''s'",
+          "a single quote inside a path is escaped for /bin/sh")
+    check("entry: python3 t.py --staged" in precommit_entry("t.py", executable="python3"),
+          "the pre-commit entry names the same interpreter")
+
     check(hook_script("gdbfence.py").startswith("#!/bin/sh"),
           "the git hook is a shell script")
     check("--staged" in hook_script("gdbfence.py"),
           "the git hook runs the tool against the staged files")
     check("language: system" in precommit_entry("gdbfence.py"),
           "the pre-commit entry needs no install step")
+
+    # ---- the harness itself. A check() that cannot record a failure would
+    # report every defect below as a pass, which is the one failure no other
+    # assertion here could ever see. Three deliberate failures are recorded
+    # against a scratch mark and then taken back off the tally.
+    quiet = sys.stdout
+    sys.stdout = io.StringIO()
+    mark = len(failed)
+    try:
+        check(False, "probe: a false condition must be recorded as a failure")
+        raises(lambda: None, "probe: a call that raises nothing must fail")
+        raises(lambda: [][0], "probe: the wrong exception must fail")
+    finally:
+        sys.stdout = quiet
+    probe = failed[mark:]
+    del failed[mark:]
+    check(len(probe) == 3,
+          "check() and raises() really do record a failure  <-- pinned defect")
+    check("no error raised" in probe[1] and "wrong exception" in probe[2],
+          "and say which way the call under test went wrong")
+
+    # ---- the io layer, against a real temporary git repository.
+    #
+    # Everything above this line is pure. Everything below writes to a
+    # temporary directory and runs git, because the parts that had never run
+    # were exactly the parts that do: the hook it installs, the read from the
+    # index, and the history check that prints the filter-repo remedy. A remedy
+    # that has never been printed against a repository which really carries a
+    # geodatabase has not been tested.
+    def run(args, cwd=None):
+        """A command's (returncode, combined output). Drives git and gdbfence."""
+        proc = subprocess.Popen(args, cwd=cwd, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT)
+        out = proc.communicate()[0]
+        return proc.returncode, out.decode("utf-8", "replace")
+
+    def capture(fn):
+        """(what fn returned, everything it printed to either stream)."""
+        buf = io.StringIO()
+        real_out, real_err = sys.stdout, sys.stderr
+        sys.stdout = sys.stderr = buf
+        try:
+            result = fn()
+        finally:
+            sys.stdout, sys.stderr = real_out, real_err
+        return result, buf.getvalue()
+
+    def write(path, data):
+        parent = os.path.dirname(path)
+        if parent and not os.path.isdir(parent):
+            os.makedirs(parent)
+        with open(path, "wb") as fh:
+            fh.write(data)
+
+    def read(path):
+        with open(path, "rb") as fh:
+            return fh.read().decode("utf-8", "replace")
+
+    me = os.path.abspath(__file__)
+    tmp = tempfile.mkdtemp(prefix="gdbfence-selftest-")
+    here = os.getcwd()
+
+    def new_repo(name):
+        path = os.path.join(tmp, name)
+        os.makedirs(path)
+        for cmd in (["init", "-q", "."],
+                    ["config", "user.email", "selftest@example.org"],
+                    ["config", "user.name", "gdbfence self-test"],
+                    ["config", "commit.gpgsign", "false"],
+                    ["config", "core.autocrlf", "false"]):
+            run(["git"] + cmd, cwd=path)
+        return path
+
+    try:
+        # ---- the git wrapper
+        check(git(["--version"]) is not None,
+              "git is on PATH, which every assertion below this line needs")
+        check(git(["cat-file", "-s", "no-such-object-9c1f"], cwd=tmp) is None,
+              "a git command that fails returns None instead of raising")
+        check(git(["--version"], cwd=os.path.join(tmp, "no-such-dir")) is None,
+              "git refused a directory that does not exist returns None too")
+
+        # ---- reading documents off disk
+        docs = os.path.join(tmp, "docs")
+        lyrx = os.path.join(docs, "layer.lyrx")
+        write(lyrx, b'{"w": "DATABASE=C:/GIS/parcels.gdb"}')  # gdbfence: allow
+        check(codes(scan_text("layer.lyrx",
+                              document_text(lyrx, os.path.getsize(lyrx))))
+              == [NON_PORTABLE_PATH],
+              "a .lyrx really on disk is read and its drive letter found")
+
+        # TEXT_READ_LIMIT. The fixture carries a drive letter on its first line,
+        # so a file that WAS read cannot be mistaken for one that was skipped.
+        over = os.path.join(docs, "over.json")
+        payload = b'{"w": "C:/GIS/parcels.gdb"}\n'  # gdbfence: allow
+        write(over, payload + b" " * (TEXT_READ_LIMIT + 1 - len(payload)))
+        check(os.path.getsize(over) == TEXT_READ_LIMIT + 1,
+              "the oversize fixture is one byte over TEXT_READ_LIMIT")
+        check(document_text(over, os.path.getsize(over)) is None,
+              "a document over TEXT_READ_LIMIT is skipped, never read")
+        check(document_text(over, TEXT_READ_LIMIT) is not None,
+              "the SIZE is what skipped it: the same file under the limit is read")
+
+        check(document_text(os.path.join(docs, "a.gdbtable"), 10) is None,
+              "a suffix that is not a document is never opened at all")
+
+        # Every suffix the README claims is read, read off a real file.
+        #
+        # This list is written out LITERALLY rather than taken from
+        # TEXT_SUFFIXES. Looping over the constant only ever tests the suffixes
+        # that are already in it: deleting ".sql" from TEXT_SUFFIXES left this
+        # block one assertion shorter and still green, while the README went on
+        # promising that a .sql file is read. The promise is the fixture.
+        promised = (".lyrx", ".mapx", ".json", ".py", ".pyt", ".yml", ".xml",
+                    ".sql")
+        check([e for e in promised if e not in TEXT_SUFFIXES] == [],
+              "every suffix the README names is one the tool really opens")
+        for ext in TEXT_SUFFIXES:
+            probe = os.path.join(tmp, "suffixes", "probe" + ext)
+            write(probe, b'{"w": "C:/GIS/parcels.gdb"}')  # gdbfence: allow
+            check(codes(scan_text(probe,
+                                  document_text(probe, os.path.getsize(probe))))
+                  == [NON_PORTABLE_PATH],
+                  "a %s document is read and its drive letter found" % ext)
+        check(document_text(os.path.join(docs, "no-such-file.json"), 10) is None,
+              "a document that cannot be opened is skipped, not fatal")
+
+        # Binary. A .gdbtable renamed to .json, or a CIM file saved by a tool
+        # that wrote UTF-16, must not end the whole audit with a traceback.
+        write(os.path.join(docs, "nul.json"), b"\x00\x01\x02 C:/GIS")  # gdbfence: allow
+        check(document_text(os.path.join(docs, "nul.json"), 12) is None,
+              "a document holding a NUL byte is binary and is skipped")
+        broken = os.path.join(docs, "broken.json")
+        write(broken, b'{"w": "\xff\xfe C:/GIS/parcels.gdb"}')  # gdbfence: allow
+        text = document_text(broken, os.path.getsize(broken))
+        check(text is not None,
+              "bytes that are not valid UTF-8 are decoded, not fatal  <-- pinned defect")
+        check(codes(scan_text("broken.json", text)) == [NON_PORTABLE_PATH],
+              "and the drive letter inside them is still found")
+
+        # ---- walking paths on disk
+        found = dict((normalize(p), s) for p, s in walk_entries([docs]))
+        check(len(found) == 4, "walking a directory finds every file under it")
+        check(found[normalize(over)] == TEXT_READ_LIMIT + 1,
+              "each walked file carries its real size on disk")
+        check(walk_entries([over]) == [(over, TEXT_READ_LIMIT + 1)],
+              "a file argument is measured directly, not walked")
+
+        # A file the platform lists but cannot measure. Windows strips a
+        # trailing space off a path, so a file created as "trailing " through
+        # the \\?\ prefix is listed by os.walk and then not found by
+        # os.path.getsize. One unreadable file must not take the audit down
+        # with it, and it must not be counted as a zero either.
+        if os.name == "nt":
+            odd_dir = os.path.join(tmp, "odd")
+            odd = os.path.join(odd_dir, "trailing ")
+            write("\\\\?\\" + odd, b"12345")
+            check(os.listdir(odd_dir) == ["trailing "],
+                  "the fixture really is a file whose name ends in a space")
+            check(walk_entries([odd_dir]) == [],
+                  "a walked file the platform cannot stat is skipped, not fatal")
+            os.remove("\\\\?\\" + odd)
+
+        else:
+            # The POSIX equivalent of a listed-but-unmeasurable file is a dangling
+            # symlink: os.walk lists it, os.path.getsize raises on it. Running the
+            # same pair of assertions on both hosts keeps the assertion COUNT equal,
+            # so the number the README quotes is true everywhere.
+            odd_dir = os.path.join(tmp, 'odd')
+            os.makedirs(odd_dir)
+            odd = os.path.join(odd_dir, 'dangling')
+            os.symlink(os.path.join(tmp, 'no-such-target'), odd)
+            check(os.listdir(odd_dir) == ['dangling'],
+                  'the fixture really is a file the walker lists')
+            check(walk_entries([odd_dir]) == [],
+                  'a walked file the platform cannot stat is skipped, not fatal')
+            os.remove(odd)
+        rc, out = capture(lambda: main([docs, "--no-history"]))
+        check(rc == 1, "auditing that directory refuses it")
+        check("layer.lyrx" in out and "broken.json" in out,
+              "both readable documents are reported by path")
+        check("over.json" not in out,
+              "the document over the read limit is skipped end to end, and its "
+              "drive letter never reaches the report  <-- pinned defect")
+
+        # ---- a repository that really carries a geodatabase in its history
+        repo = new_repo("repo")
+        os.chdir(repo)
+        gdb_dir = os.path.join(repo, "data", "parcels.gdb")
+        for i in range(8):
+            write(os.path.join(gdb_dir, "a%08d.gdbtable" % i), b"\x00" * 300000)
+        write(os.path.join(repo, "notes.txt"), b"a clean file\n")
+        run(["git", "add", "-A"], cwd=repo)
+        rc, out = run(["git", "commit", "-qm", "add the geodatabase"], cwd=repo)
+        check(rc == 0, "the fixture repository has a geodatabase in its history")
+        check(in_history("data/parcels.gdb"),
+              "the history check finds a dataset that was really committed")
+        check(not in_history("data/never-committed.gdb"),
+              "and does not invent one that never was")
+
+        check([normalize(p) for p, _s in walk_entries([repo])
+               if "/.git/" in normalize(p)] == [],
+              "walking a repository never descends into .git")
+
+        rc, out = capture(lambda: main(["data", "--max-dataset-size", "1MB"]))
+        check(rc == 1, "a geodatabase on the command line is refused, exit 1")
+        check("NEVER_COMMIT  data/parcels.gdb" in out,
+              "the finding names the .gdb, not the 8 files inside it")
+        check("2.4 MB" in out and "over the 1.0 MB limit" in out,
+              "--max-dataset-size is read end to end and the total reported")
+        check("under the 512.0 kB per-file rule" in out,
+              "and the per-file rule every one of those files passed is named")
+        check("git filter-repo --invert-paths --force --path data/parcels.gdb"
+              in out,
+              "the remedy for a dataset already in history is printed in full")
+        check("re-clone" in out,
+              "with the warning that every collaborator must re-clone")
+        check(os.path.isdir(gdb_dir) and len(os.listdir(gdb_dir)) == 8,
+              "the remedy is PRINTED, never run: the .gdb is untouched  <-- pinned defect")
+        rc, log = run(["git", "log", "--oneline"], cwd=repo)
+        check("add the geodatabase" in log,
+              "and the history it offered to rewrite is untouched  <-- pinned defect")
+
+        rc, out = capture(
+            lambda: main(["data", "--max-dataset-size", "1MB", "--no-history"]))
+        check(rc == 1 and "NEVER_COMMIT" in out,
+              "--no-history still reports the finding")
+        check("filter-repo" not in out,
+              "--no-history skips the history check, so no remedy is printed")
+
+        rc, out = capture(lambda: main(["data", "--max-dataset-size", "1MB",
+                                        "--ignore", "data/*"]))
+        check(rc == 0 and "VERDICT: CLEAN" in out,
+              "--ignore GLOB drops a walked directory end to end, windows "
+              "separators and all")
+
+        # A dataset that is refused but was never committed has nothing for
+        # filter-repo to take out, so the remedy must stay off the screen.
+        write(os.path.join(repo, "staging", "new.gdb", "a.gdbtable"),
+              b"\x00" * 10)
+        rc, out = capture(lambda: main(["staging"]))
+        check(rc == 1 and "NEVER_COMMIT" in out,
+              "a geodatabase that was never committed is still refused")
+        check("filter-repo" not in out,
+              "but no history remedy is printed for a path git never saw  <-- pinned defect")
+
+        check(capture(lambda: main([me, "--no-history"]))[0] == 0,
+              "gdbfence scans its own source clean  <-- pinned defect")
+
+        # ---- --staged reads the index, not the working tree
+        staged_lyrx = os.path.join(repo, "layer.lyrx")
+        dirty = b'{"w": "DATABASE=C:/GIS/parcels.gdb"}'  # gdbfence: allow
+        clean = b'{"w": "DATABASE=./parcels.gdb"}'
+        write(staged_lyrx, dirty)
+        run(["git", "add", "layer.lyrx"], cwd=repo)
+        write(staged_lyrx, clean)
+        check(scan_text("layer.lyrx", read(staged_lyrx)) == [],
+              "the working copy on disk is clean by the time the hook runs")
+        rc, out = capture(lambda: main(["--staged", "--no-history"]))
+        check(rc == 1 and "NON_PORTABLE_PATH  layer.lyrx" in out,
+              "--staged reads the INDEX, so fixing the file afterwards does not "
+              "get the staged drive letter past the hook  <-- pinned defect")
+        sizes = dict(staged_entries())
+        check(sizes.get("layer.lyrx") == len(dirty) != os.path.getsize(staged_lyrx),
+              "the staged SIZE comes from the index as well, not from disk")
+
+        # An index entry git cannot size: a gitlink whose commit this repository
+        # does not have. Dropping it would drop a whole dataset out of the audit
+        # in silence, so the working tree answers instead.
+        run(["git", "update-index", "--add", "--cacheinfo",
+             "160000,0123456789012345678901234567890123456789,sub"], cwd=repo)
+        write(os.path.join(repo, "sub"), b"12345")
+        check(dict(staged_entries()).get("sub") == 5,
+              "an index entry git cannot size falls back to the size on disk")
+        run(["git", "update-index", "--add", "--cacheinfo",
+             "160000,0123456789012345678901234567890123456789,ghost"], cwd=repo)
+        check("ghost" not in dict(staged_entries()),
+              "an entry git cannot size with nothing on disk either is dropped, "
+              "not guessed at")
+        run(["git", "update-index", "--force-remove", "sub"], cwd=repo)
+        run(["git", "update-index", "--force-remove", "ghost"], cwd=repo)
+        os.remove(os.path.join(repo, "sub"))
+
+        # ---- git is not there to be had
+        os.chdir(tmp)
+        check(staged_entries() is None,
+              "staged_entries outside a repository returns None, not an empty "
+              "list that would read as CLEAN  <-- pinned defect")
+        rc, out = capture(lambda: main(["--staged"]))
+        check(rc == 2, "--staged outside a repository exits 2, not 0")
+        check("git could not list staged files" in out, "and says why")
+        rc, out = capture(lambda: install("gdbfence.py", True))
+        check(rc == 2, "--install outside a repository exits 2")
+        check("language: system" in out,
+              "and still prints the pre-commit entry, which needs no repository")
+
+        # ---- --install
+        hookrepo = new_repo("hookrepo")
+        os.chdir(hookrepo)
+        hook = os.path.join(hookrepo, ".git", "hooks", "pre-commit")
+        rc, out = capture(lambda: main(["--install"]))
+        check(rc == 0 and not os.path.exists(hook),
+              "--install without --apply writes NOTHING  <-- pinned defect")
+        check("Re-run with --apply" in out,
+              "it names the file it would write and how to write it")
+        rc, out = capture(lambda: install("gdbfence.py", True))
+        check(rc == 0 and os.path.isfile(hook), "--install --apply writes the hook")
+        check(read(hook) == hook_script("gdbfence.py"),
+              "the hook on disk is byte for byte the text printed, with no CRLF "
+              "that a /bin/sh would hand to python as a flag  <-- pinned defect")
+        rc, out = capture(lambda: install("gdbfence.py", True))
+        check(rc == 2 and read(hook) == hook_script("gdbfence.py"),
+              "a second --apply refuses to overwrite the hook and changes nothing")
+        check("Refusing to overwrite" in out, "and names the file it left alone")
+
+        badrepo = new_repo("badrepo")
+        os.chdir(badrepo)
+        shutil.rmtree(os.path.join(badrepo, ".git", "hooks"))
+        write(os.path.join(badrepo, ".git", "hooks"), b"not a directory\n")
+        rc, out = capture(lambda: install("gdbfence.py", True))
+        check(rc == 2, "a hooks path that is not a directory exits 2, not a "
+                       "traceback")
+        check("could not write" in out, "and names the file it could not write")
+
+        # ---- the installed hook, against real commits
+        os.chdir(hookrepo)
+        shutil.copy(me, os.path.join(hookrepo, "gdbfence.py"))
+        write(os.path.join(hookrepo, "data", "parcels.gdb", "a.gdbtable"),
+              b"\x00" * 1000)
+        run(["git", "add", "-A"], cwd=hookrepo)
+        rc, out = run(["git", "commit", "-m", "stage a geodatabase"],
+                      cwd=hookrepo)
+        check(rc != 0, "the installed hook REFUSES a commit carrying a .gdb")
+        check("NEVER_COMMIT  data/parcels.gdb" in out,
+              "and the refusal is gdbfence's finding, not a broken hook  <-- pinned defect")
+        rc, log = run(["git", "log", "--oneline"], cwd=hookrepo)
+        check("stage a geodatabase" not in log, "so the commit does not exist")
+
+        run(["git", "reset", "-q"], cwd=hookrepo)
+        write(os.path.join(hookrepo, "notes.txt"), b"a clean file\n")
+        run(["git", "add", "notes.txt"], cwd=hookrepo)
+        rc, out = run(["git", "commit", "-m", "a clean commit"], cwd=hookrepo)
+        check(rc == 0, "the same hook lets a clean commit through  <-- pinned defect")
+        check("VERDICT: CLEAN" in out,
+              "having really run and found nothing, not having been skipped")
+    finally:
+        os.chdir(here)
+        # git writes its objects read-only, and Windows refuses to unlink a
+        # read-only file, so rmtree alone leaves the whole fixture repository
+        # behind. Every self-test run would leak a few megabytes of temporary
+        # directory, which is a poor advertisement for a tool about disk bloat.
+        for root, _dirs, names in os.walk(tmp):
+            for name in names:
+                target = os.path.join(root, name)
+                # A dangling symlink has no target to chmod, and os.walk lists it
+                # among the names. Letting that raise took the whole teardown down
+                # and leaked the fixture directory.
+                if os.path.islink(target) or not os.path.exists(target):
+                    continue
+                os.chmod(target, 0o600)
+        shutil.rmtree(tmp, ignore_errors=True)
+        check(not os.path.isdir(tmp),
+              "the self-test leaves no temporary directory behind  <-- pinned defect")
 
     print("-" * 68)
     total = passed[0] + len(failed)
@@ -947,7 +1486,7 @@ def _parse(argv):
     ap.add_argument("--apply", action="store_true",
                     help="write the hook file. Without this nothing is written.")
     ap.add_argument("--self-test", dest="self_test", action="store_true",
-                    help="run the offline assertions and exit")
+                    help="run the assertions and exit. The io half needs git")
     # argparse runs type= over a default that is still a string, so the value
     # from GDBFENCE_MAX_DATASET_SIZE goes through parse_size as well, and an
     # unreadable one is a usage error rather than a traceback.

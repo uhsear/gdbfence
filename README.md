@@ -13,33 +13,35 @@ wherever the reader guesses. In ArcGIS Pro that is usually the Gulf of Mexico.
 
 ```
 $ python gdbfence.py --self-test
-gdbfence self-test: no git, no disk, no network
+gdbfence self-test: no network, a temporary git repo for the io layer
 --------------------------------------------------------------------
 PASS  a file under a .gdb belongs to that .gdb
-PASS  the outermost container wins over a nested one
-PASS  a path with spaces in it groups like any other
 PASS  parcels.gdb.zip is ONE FILE, never walked as a directory  <-- pinned defect
-PASS  the zip forms a single one-file dataset  <-- pinned defect
-PASS  the zip is not reported as a geodatabase  <-- pinned defect
+PASS  a plain file named .gdb is a FILE, not a directory of 1  <-- pinned defect
 PASS  340 files under one .gdb group into ONE dataset
 PASS  340 files of 411 kB is ONE 139.7 MB dataset, not 340 small files
 PASS  every one of those 411 kB files passes the 500 kB per-file rule
 PASS  the 139.7 MB dataset is refused while all 340 files pass check-added-large-files
-PASS  the finding names the .gdb, not one of its 340 files
 ...
-PASS  a shapefile's size is the sum of its sidecars
-PASS  an uppercase but complete shapefile set produces nothing
 PASS  --ignore folds case the same way on every platform  <-- pinned defect
-PASS  a CIM document with an absolute user path is non-portable
 PASS  the same CIM document with a relative path is fine  <-- pinned defect
-PASS  an escaped relative path is not a UNC share  <-- pinned defect
+PASS  the marker inside a STRING does not waive the real path beside it  <-- pinned defect
 PASS  a path with a space is quoted into ONE argument  <-- pinned defect
-PASS  an incomplete shapefile is NOT offered to filter-repo, you add the .prj
-...
 PASS  a path that does not exist is a usage error, not a clean pass  <-- pinned defect
-PASS  the pre-commit entry needs no install step
+PASS  check() and raises() really do record a failure  <-- pinned defect
+...
+PASS  a document over TEXT_READ_LIMIT is skipped, never read
+PASS  bytes that are not valid UTF-8 are decoded, not fatal  <-- pinned defect
+PASS  the remedy for a dataset already in history is printed in full
+PASS  the remedy is PRINTED, never run: the .gdb is untouched  <-- pinned defect
+PASS  and the history it offered to rewrite is untouched  <-- pinned defect
+PASS  gdbfence scans its own source clean  <-- pinned defect
+PASS  --install without --apply writes NOTHING  <-- pinned defect
+PASS  the installed hook REFUSES a commit carrying a .gdb
+PASS  the same hook lets a clean commit through  <-- pinned defect
+PASS  the self-test leaves no temporary directory behind  <-- pinned defect
 --------------------------------------------------------------------
-119 assertions, 0 failed
+230 assertions, 0 failed
 ```
 
 ## Requirements
@@ -47,8 +49,10 @@ PASS  the pre-commit entry needs no install step
 Python 3.9 or newer. Nothing to install, no `arcpy`, no third-party package. It runs on ArcGIS
 Pro's Python and on a plain `python3` equally.
 
-`git` is needed only for `--staged`, for `--install`, and for the read-only history check that
-prints the filter-repo command. Auditing paths on disk needs no repository at all.
+`git` is needed for `--staged`, for `--install`, and for the read-only history check that prints
+the filter-repo command. Auditing paths on disk needs no repository at all. `--self-test` needs
+it too: its last seventy assertions build a throwaway repository in a temporary directory, install
+the hook into it, and put real commits past it.
 
 ```
 git clone https://github.com/uhsear/gdbfence.git
@@ -94,9 +98,11 @@ pre-commit can run this alongside `check-added-large-files` rather than instead 
 | `--no-history` | off | Skip the read-only git check that prints the filter-repo command. |
 | `--install` | off | Print the hook forms and write `.git/hooks/pre-commit`. |
 | `--apply` | off | Write the hook file. Without it nothing is written. |
-| `--self-test` | off | Run the offline assertions and exit. |
+| `--self-test` | off | Run the assertions and exit. The io half needs `git` and a temporary directory. |
 
-Exit codes: 0 clean, 1 findings, 2 a git or install step failed, 64 usage error.
+Exit codes: 0 clean, 1 findings, 2 a git step, an install step or a flag value failed, 64 usage
+error. An unreadable `--max-dataset-size`, from the flag or from the environment variable, is
+argparse's own error and exits 2.
 
 ## What it refuses
 
@@ -149,8 +155,10 @@ at files that are present.
 
 The naive version of this tool has its own trap, and the self-test pins it. A substring test for
 `.gdb` turns `archive/parcels.gdb.zip` into a directory that is never walked and a dataset that
-is never reported. Only ancestor path components are tested for a container suffix, and three
-assertions hold that line.
+is never reported. The rule that stops it has two halves: only ANCESTOR path components are
+tested, and each is tested with `endswith` rather than for a substring. Seven assertions hold that
+line and each half has its own, because a fixture that only ever names `parcels.gdb.zip` leaves
+the other half free to change with nothing going red.
 
 The UNC check had the same shape of bug, found by running it. A CIM document spells a relative
 path `"..\\data\\parcels.gdb"`, which contains `\\data\`, so the first pattern reported every
@@ -168,18 +176,21 @@ A file that must carry an example path says so on that line:
 ws = "C:/gis/staging"  # gdbfence: allow
 ```
 
-The waiver is read from the original line, before comments are stripped, and it
-applies only to the line it sits on. gdbfence uses it on its own test fixtures,
-and scans its own source clean.
+The waiver applies only to the line it sits on. In Python it is read from the
+comments and docstrings alone, never from the code, so a string literal that
+merely contains the marker cannot waive a real hardcoded path sitting beside it
+on that line. In any other file type there is no comment syntax to trust, so the
+marker counts anywhere on the line. gdbfence uses the waiver on its own test
+fixtures, and scans its own source clean.
 
 In Python and .pyt files, comments and docstrings are not scanned at all. A
 drive letter in prose is documentation. One in an assignment is the defect.
 
 ## Limits
 
-- It does not know a comment from code. A drive letter written in a comment or a docstring is
-  still reported. Use `--ignore` for the file, or move the example path into a string the tool
-  does not read.
+- It knows a comment from code in `.py` and `.pyt` files only. In a `.md`, `.json` or `.lyrx`
+  file every line is code, so a drive letter written in prose is still reported. Waive that line,
+  or use `--ignore` for the file.
 - Size only, not content. It has no opinion about whether 9 MB of geodatabase is worth committing,
   only that 11 MB is over the limit.
 - `--ignore` is `fnmatch`, not `.gitignore` syntax. `vendor/*` and `*.tif` work. Negation and `**`
@@ -187,7 +198,8 @@ drive letter in prose is documentation. One in an assignment is the defect.
 - It never runs `git filter-repo`, and it never stages, unstages or deletes anything. `--apply`
   writes one file, the pre-commit hook, and refuses to overwrite a hook that already exists.
 - The hook it writes calls `python gdbfence.py --staged` from the repository root, so keep a copy
-  of the file there, or edit the one line in `.git/hooks/pre-commit`.
+  of the file there, or edit the one line in `.git/hooks/pre-commit`. It is written with LF line
+  endings on every platform, because a `/bin/sh` reading a CRLF hook passes `--staged\r` on.
 - A `.gdb` big enough to matter is usually already ignored. This tool is for the repository where
   that was never set up, and for the moment somebody adds a new data directory to one where it was.
 - It reads sizes and document text from the git index under `--staged`, so a file that is staged
