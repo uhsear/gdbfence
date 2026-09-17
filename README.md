@@ -226,3 +226,4 @@ MIT.
 Other single-file tools in this portfolio that pair with this one:
 
 - [fcload](https://github.com/uhsear/fcload) - what to do with the geodatabase instead of committing it
+- [litswap](https://github.com/uhsear/litswap) - retarget the connection string instead of committing it
