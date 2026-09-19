@@ -116,6 +116,19 @@ ALLOW_RE = re.compile(r"gdbfence:\s*allow")
 # every portable layer file in the repository is reported as non-portable.
 UNC_RE = re.compile(r"""(?:^|[\s"'=(\[,:])(\\{2,4}[A-Za-z0-9._$-]+\\)""")
 
+# An ArcCatalog connection folder path, written with either separator and in
+# any case, because Windows resolves it that way.
+#
+# "Database Connections\prod.sde" carries no drive letter and no UNC host,  # gdbfence: allow
+# so DRIVE_RE and UNC_RE both structurally cannot see it, and a repository full
+# of these scans clean. It is not portable: ArcGIS resolves it against
+# %APPDATA%\ESRI\Desktop10.x\ArcCatalog in ONE user profile. The build agent has  # gdbfence: allow
+# no such folder and neither does the service account, so the job runs at the
+# desk it was written at and nowhere else. Measured over a 743-file legacy
+# estate: 279 files name the folder and 56 of them held a connection path that
+# no other rule here reported.
+CONNECTION_FOLDER_RE = re.compile(r"Database Connections[\\/]", re.I)
+
 # A path made only of these characters needs no quoting in the printed
 # filter-repo command. Anything else is double quoted. GIS paths have spaces in
 # them as a matter of routine, and an unquoted --path C:/GIS Data/parcels.gdb is  # gdbfence: allow
@@ -402,6 +415,16 @@ def scan_text(path, text):
                 NON_PORTABLE_PATH, path,
                 "line %d holds the UNC path \"%s\", which only resolves inside one "
                 "network" % (line_no, m.group(1))))
+            continue
+        # Checked last, so a line that also carries a drive letter or a UNC host
+        # keeps the older, more specific message.
+        m = CONNECTION_FOLDER_RE.search(line)
+        if m:
+            findings.append(Finding(
+                NON_PORTABLE_PATH, path,
+                "line %d holds the ArcCatalog connection path \"%s\", which only "
+                "resolves in the user profile that made the connection file"
+                % (line_no, m.group(0))))
     return findings
 
 
@@ -887,6 +910,33 @@ def self_test():
           "a relative workspace is fine")
     check(len(scan_text("a.py", 'x = "C:/a"\ny = 1\nz = "E:/b"')) == 2,  # gdbfence: allow
           "every offending line is reported, not just the first")
+
+    # ---- the ArcCatalog connection folder. No drive letter and no UNC host, so
+    # the two rules above cannot see it, and a whole repository of these used to
+    # scan clean.
+    bs = chr(92)
+    f = scan_text("etl.py", 'ws = "Database Connections' + bs + bs + 'prod.sde"')
+    check(codes(f) == [NON_PORTABLE_PATH],
+          "a per-user connection folder path is non-portable  <-- pinned defect")
+    check("Database Connections" in f[0].message and "line 1" in f[0].message,
+          "the report names the connection folder and the line")
+    check(codes(scan_text("etl.py", 'ws = "Database Connections/prod.sde"'))  # gdbfence: allow
+          == [NON_PORTABLE_PATH],
+          "the forward slash spelling is caught too")
+    check(codes(scan_text("etl.py", 'ws = "database connections/prod.sde"'))  # gdbfence: allow
+          == [NON_PORTABLE_PATH],
+          "windows folds the case of the folder, so the rule does too")
+    check(scan_text("etl.py", 'note = "Database Connections are per user"') == [],
+          "the folder NAME without a path separator is prose, not a path")
+    check(scan_text("a.py", "# Database Connections" + bs + "prod.sde is per-user")
+          == [],
+          "a connection path inside a python comment is not flagged  <-- pinned defect")
+    check(scan_text("a.py", 'ws = "Database Connections' + bs + bs
+                    + 'prod.sde"  # gdbfence: allow') == [],
+          "the waiver covers the connection rule like every other content rule")
+    both = scan_text("etl.py", 'ws = "C:/x/Database Connections/prod.sde"')  # gdbfence: allow
+    check(len(both) == 1 and "absolute path" in both[0].message,
+          "a line carrying both keeps the drive letter message, and reports once")
 
     # ---- prose in python source is documentation, not a hardcoded path
     check(scan_text("a.py", "# look for C:" + chr(92) + " helps nobody") == [],

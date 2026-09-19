@@ -26,6 +26,8 @@ PASS  the 139.7 MB dataset is refused while all 340 files pass check-added-large
 PASS  --ignore folds case the same way on every platform  <-- pinned defect
 PASS  the same CIM document with a relative path is fine  <-- pinned defect
 PASS  the marker inside a STRING does not waive the real path beside it  <-- pinned defect
+PASS  a per-user connection folder path is non-portable  <-- pinned defect
+PASS  a connection path inside a python comment is not flagged  <-- pinned defect
 PASS  a path with a space is quoted into ONE argument  <-- pinned defect
 PASS  a path that does not exist is a usage error, not a clean pass  <-- pinned defect
 PASS  check() and raises() really do record a failure  <-- pinned defect
@@ -41,7 +43,7 @@ PASS  the installed hook REFUSES a commit carrying a .gdb
 PASS  the same hook lets a clean commit through  <-- pinned defect
 PASS  the self-test leaves no temporary directory behind  <-- pinned defect
 --------------------------------------------------------------------
-230 assertions, 0 failed
+238 assertions, 0 failed
 ```
 
 ## Requirements
@@ -112,8 +114,10 @@ argparse's own error and exits 2.
 - **An incomplete shapefile.** A `.shp` staged without `.shx`, `.dbf` or `.prj`. The report names
   the missing extensions and says what a missing `.prj` costs.
 - **A non-portable path** inside a text or CIM document: an absolute drive letter such as
-  `C:\GIS\parcels.gdb`, or a UNC path such as `\\gisfiles\parcels`. It reads `.lyrx`, `.mapx`,
-  `.json`, `.py`, `.pyt`, `.yml`, `.xml`, `.sql` and a few more, and gives the line number.
+  `C:\GIS\parcels.gdb`, a UNC path such as `\\\gisfiles\parcels`, or an ArcCatalog connection
+  folder path such as `Database Connections\prod.sde`. It reads `.lyrx`, `.mapx`,
+  `.json`, `.py`, `.pyt`, `.yml`, `.xml`, `.sql` and a few more, and gives the line number
+  for each one.
 - **Files that should essentially never be committed**: `.gdb`, `.sde`, `.lock`, `.mdb` and
   `.gdbindexes`.
 
@@ -159,6 +163,15 @@ is never reported. The rule that stops it has two halves: only ANCESTOR path com
 tested, and each is tested with `endswith` rather than for a substring. Seven assertions hold that
 line and each half has its own, because a fixture that only ever names `parcels.gdb.zip` leaves
 the other half free to change with nothing going red.
+
+`Database Connections\prod.sde` is the one that hides. It carries no drive letter and
+no UNC host, so the two patterns above structurally cannot see it, and a repository full of them
+scans clean. ArcGIS resolves that path against `%APPDATA%\ESRI\Desktop10.x\ArcCatalog` in
+one user profile. The build agent has no such folder, the service account has no such folder,
+and the job runs at the desk that wrote it and nowhere else. Measured over a 743-file legacy
+ArcGIS estate, 279 files name that folder, and 56 of them held a connection path that no other
+rule here reported. The folder name with no path separator after it stays silent, because that
+is prose about a feature and not a path.
 
 The UNC check had the same shape of bug, found by running it. A CIM document spells a relative
 path `"..\\data\\parcels.gdb"`, which contains `\\data\`, so the first pattern reported every
