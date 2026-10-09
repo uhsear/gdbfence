@@ -29,6 +29,7 @@ PASS  the marker inside a STRING does not waive the real path beside it  <-- pin
 PASS  a per-user connection folder path is non-portable  <-- pinned defect
 PASS  a connection path inside a python comment is not flagged  <-- pinned defect
 PASS  a path with a space is quoted into ONE argument  <-- pinned defect
+PASS  a unique prefix of --apply is refused, not read as --apply  <-- pinned defect
 PASS  a path that does not exist is a usage error, not a clean pass  <-- pinned defect
 PASS  check() and raises() really do record a failure  <-- pinned defect
 ...
@@ -43,7 +44,7 @@ PASS  the installed hook REFUSES a commit carrying a .gdb
 PASS  the same hook lets a clean commit through  <-- pinned defect
 PASS  the self-test leaves no temporary directory behind  <-- pinned defect
 --------------------------------------------------------------------
-238 assertions, 0 failed
+239 assertions, 0 failed
 ```
 
 ## Requirements

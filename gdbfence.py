@@ -1067,6 +1067,19 @@ def self_test():
               "bare paths are read")
         check(_parse(["--install", "--apply"]).apply is True, "--apply is read")
         check(_parse(["--no-history"]).no_history is True, "--no-history is read")
+        # A unique prefix of --apply must be refused, not read as --apply: an
+        # abbreviation that writes the hook is a write nobody typed.
+        real_stderr, sys.stderr = sys.stderr, io.StringIO()
+        prefix_exit = None
+        try:
+            try:
+                _parse(["--install", "--ap"])
+            except SystemExit as exc:
+                prefix_exit = exc.code
+        finally:
+            sys.stderr = real_stderr
+        check(prefix_exit == 2,
+              "a unique prefix of --apply is refused, not read as --apply  <-- pinned defect")
 
         os.environ["GDBFENCE_MAX_DATASET_SIZE"] = "25MB"
         check(_parse([]).max_dataset_size == 25000000,
@@ -1514,6 +1527,7 @@ def _parse(argv):
                     "shapefile missing its .prj, or a drive letter into git.",
         epilog="Nothing is written without --apply, and the filter-repo "
                "command is printed, never run.",
+        allow_abbrev=False,
     )
     ap.add_argument("paths", nargs="*", help="files or directories to audit")
     ap.add_argument("--staged", action="store_true",
