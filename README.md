@@ -54,7 +54,7 @@ Pro's Python and on a plain `python3` equally.
 
 `git` is needed for `--staged`, for `--install`, and for the read-only history check that prints
 the filter-repo command. Auditing paths on disk needs no repository at all. `--self-test` needs
-it too: its last seventy assertions build a throwaway repository in a temporary directory, install
+it too: its last seventy-seven assertions build a throwaway repository in a temporary directory, install
 the hook into it, and put real commits past it.
 
 ```
@@ -161,7 +161,7 @@ at files that are present.
 The naive version of this tool has its own trap, and the self-test pins it. A substring test for
 `.gdb` turns `archive/parcels.gdb.zip` into a directory that is never walked and a dataset that
 is never reported. The rule that stops it has two halves: only ANCESTOR path components are
-tested, and each is tested with `endswith` rather than for a substring. Seven assertions hold that
+tested, and each is tested with `endswith` rather than for a substring. Eight assertions hold that
 line and each half has its own, because a fixture that only ever names `parcels.gdb.zip` leaves
 the other half free to change with nothing going red.
 
