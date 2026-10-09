@@ -1,6 +1,6 @@
 # gdbfence
 
-Refuse the commit that puts a File Geodatabase, a shapefile missing its .prj, or a drive letter into git. Names what already bloats the history and prints the filter-repo command.
+Refuse the commit that puts a File Geodatabase, a shapefile missing its .prj, or a path that exists on one machine only into git. Names what already bloats the history and prints the filter-repo command.
 
 Someone runs `git add data/`. Inside `parcels.gdb` are 340 files and the largest is 411 kB, so
 pre-commit's `check-added-large-files` passes every one of them against its 500 kB per-file
@@ -10,6 +10,13 @@ later. Nobody notices on the day, because nothing failed.
 Three commits earlier, somebody staged `roads.shp`, `roads.shx` and `roads.dbf` but not
 `roads.prj`. A shapefile with no `.prj` carries no CRS at all, so every checkout of it lands
 wherever the reader guesses. In ArcGIS Pro that is usually the Gulf of Mexico.
+
+Then a nightly script moves from an analyst's desk to a scheduled server. Its first call is
+`AddToolbox` on `ArcGIS\Desktop10.8\ArcToolbox\Toolboxes`, built from
+`os.environ["ProgramFiles(x86)"]`, so the line carries no drive letter. The server has ArcGIS
+Pro and no ArcMap. The next line is one `Append` call with a field map of 2,400 characters,
+and 26 of its input paths sit on two file shares. The old scan reported one share on that line
+and nothing at all on the `AddToolbox` line.
 
 ```
 $ python gdbfence.py --self-test
@@ -25,9 +32,15 @@ PASS  the 139.7 MB dataset is refused while all 340 files pass check-added-large
 ...
 PASS  --ignore folds case the same way on every platform  <-- pinned defect
 PASS  the same CIM document with a relative path is fine  <-- pinned defect
-PASS  the marker inside a STRING does not waive the real path beside it  <-- pinned defect
 PASS  a per-user connection folder path is non-portable  <-- pinned defect
 PASS  a connection path inside a python comment is not flagged  <-- pinned defect
+PASS  an install-tree toolbox built from an environment variable is non-portable  <-- pinned defect
+PASS  an install-tree path inside a python comment is not flagged  <-- pinned defect
+PASS  every input path in a long field map is counted, not just the first  <-- pinned defect
+PASS  the second share, hidden behind the first, is named  <-- pinned defect
+PASS  shares hidden behind an earlier drive letter are counted  <-- pinned defect
+PASS  a field map inside a python comment is not flagged  <-- pinned defect
+PASS  the marker inside a STRING does not waive the real path beside it  <-- pinned defect
 PASS  a path with a space is quoted into ONE argument  <-- pinned defect
 PASS  a unique prefix of --apply is refused, not read as --apply  <-- pinned defect
 PASS  a path that does not exist is a usage error, not a clean pass  <-- pinned defect
@@ -39,12 +52,14 @@ PASS  the remedy for a dataset already in history is printed in full
 PASS  the remedy is PRINTED, never run: the .gdb is untouched  <-- pinned defect
 PASS  and the history it offered to rewrite is untouched  <-- pinned defect
 PASS  gdbfence scans its own source clean  <-- pinned defect
+PASS  a script on disk with an install-tree AddToolbox is refused
+PASS  and its 4,000-character field map is counted in the same run
 PASS  --install without --apply writes NOTHING  <-- pinned defect
 PASS  the installed hook REFUSES a commit carrying a .gdb
 PASS  the same hook lets a clean commit through  <-- pinned defect
 PASS  the self-test leaves no temporary directory behind  <-- pinned defect
 --------------------------------------------------------------------
-239 assertions, 0 failed
+271 assertions, 0 failed
 ```
 
 ## Requirements
@@ -54,7 +69,7 @@ Pro's Python and on a plain `python3` equally.
 
 `git` is needed for `--staged`, for `--install`, and for the read-only history check that prints
 the filter-repo command. Auditing paths on disk needs no repository at all. `--self-test` needs
-it too: its last seventy-seven assertions build a throwaway repository in a temporary directory, install
+it too: its last seventy-nine assertions build a throwaway repository in a temporary directory, install
 the hook into it, and put real commits past it.
 
 ```
@@ -116,9 +131,10 @@ argparse's own error and exits 2.
   the missing extensions and says what a missing `.prj` costs.
 - **A non-portable path** inside a text or CIM document: an absolute drive letter such as
   `C:\GIS\parcels.gdb`, a UNC path such as `\\\gisfiles\parcels`, or an ArcCatalog connection
-  folder path such as `Database Connections\prod.sde`. It reads `.lyrx`, `.mapx`,
-  `.json`, `.py`, `.pyt`, `.yml`, `.xml`, `.sql` and a few more, and gives the line number
-  for each one.
+  folder path such as `Database Connections\prod.sde`, or a toolbox inside the ArcGIS install
+  tree. Inside a serialized field map it counts every input path, not just the first one on the
+  line. It reads `.lyrx`, `.mapx`, `.json`, `.py`, `.pyt`, `.yml`, `.xml`, `.sql` and a few
+  more, and gives the line number for each one.
 - **Files that should essentially never be committed**: `.gdb`, `.sde`, `.lock`, `.mdb` and
   `.gdbindexes`.
 
@@ -182,6 +198,74 @@ a path, and two more assertions pin it.
 Credential scanning is deliberately absent. `gitleaks` and `detect-secrets` do that properly, and
 an `.sde` file with a saved password is caught here as an `.sde` file, not as a secret.
 
+## Paths that exist on one machine only
+
+Two more path shapes passed every rule above. Both run fine at the desk that wrote them.
+
+**A toolbox in the ArcGIS install tree.** ArcMap kept its system toolboxes under
+`ArcGIS\Desktop10.x\ArcToolbox\Toolboxes`. ArcGIS Pro 3.6 keeps them under
+`ArcGIS\Pro\Resources\ArcToolBox\toolboxes`, which is the spelling on disk. A script that hands
+either path to `AddToolbox` runs only where that release is installed. When the path is built
+from `os.environ["ProgramFiles(x86)"]` or `%ProgramFiles%`, it has no drive letter, so the
+drive-letter rule cannot see it. The rule matches `ArcToolbox\Toolboxes\` with either separator,
+in any case and escaped or not, and the message names the release when the path gives one. Esri's
+[ImportToolbox reference](https://doc.esri.com/en/arcgis-pro/latest/arcpy/functions/importtoolbox.html)
+says the function "is equivalent to the AddToolbox function", and that "any of the core ArcGIS
+toolboxes are accessible in a script by default". So the fix is usually to delete the line. When
+the path also has a drive letter, the line is reported once, as an install path.
+
+**Every input path inside a field map.** `FieldMappings.exportToString` and a ModelBuilder
+export both write one entry per output field, in this shape. This line is copied from a real
+call under ArcGIS Pro 3.6 against a synthetic feature class:
+
+```
+NAME "NAME" true true false 50 Text 0 0,First,#,<input path>,NAME,0,49
+```
+
+One `Append` call can carry hundreds of these entries in one string. The UNC rule reports the
+first path on a line and stops, so the second share in that string was never named. A drive
+letter early in the string hid every share after it. Now each entry whose merge rule is one that
+the [FieldMap reference](https://doc.esri.com/en/arcgis-pro/latest/arcpy/classes/fieldmap.html)
+lists (First, Last, Join, Min, Max, Mean, Median, Sum, StDev, Count) has its input path judged
+alone. The line gets one finding that counts the paths under each root. Any path outside the
+field map on that line is still judged by the ordinary rules.
+
+Before and after, on the synthetic script from the story at the top:
+
+```
+$ python gdbfence.py scripts --no-history          # the version before this rule
+gdbfence: 1 file(s) from 1 path(s) on the command line
+
+  NON_PORTABLE_PATH  scripts/nightly_append.py
+      line 5 holds the UNC path "\\filesrv01\", which only resolves inside one network
+VERDICT: REFUSE
+
+$ python gdbfence.py scripts --no-history
+gdbfence: 1 file(s) from 1 path(s) on the command line
+
+  NON_PORTABLE_PATH  scripts/nightly_append.py
+      line 4 holds the ArcGIS install-tree path "ArcGIS\Desktop10.8\ArcToolbox\Toolboxes\", which exists only where that ArcGIS release is installed. The core toolboxes need no AddToolbox
+  NON_PORTABLE_PATH  scripts/nightly_append.py
+      line 5 holds a field map with 26 input path(s) that resolve on one network or machine only: 25 under \\filesrv01\, 1 under \\filesrv02\
+VERDICT: REFUSE
+```
+
+### Why not just use Analyze Tools For Pro
+
+Use it before a migration. Esri's
+[Analyze Tools For Pro](https://pro.arcgis.com/en/pro-app/3.6/tool-reference/data-management/analyzetoolsforpro.htm)
+checks scripts and toolboxes for what ArcGIS Pro does not support: unsupported tools and
+environments, `arcpy.mapping`, personal geodatabases and Python 2 code. Those are its job, and
+gdbfence checks none of them.
+
+A path that exists on one machine is not on its list, because that script is valid Pro Python.
+Run under ArcGIS Pro 3.6 against the same synthetic script, it reported this:
+
+```
+Analyzing Python script ...\scripts\nightly_append.py for use within ArcGISPro:
+No problems
+```
+
 ## Waiving a line
 
 A file that must carry an example path says so on that line:
@@ -219,6 +303,11 @@ drive letter in prose is documentation. One in an assignment is the defect.
 - It reads sizes and document text from the git index under `--staged`, so a file that is staged
   but not yet written to disk is measured and read correctly. Auditing `PATHS` reads the working
   tree instead, which is the right answer for that question and a different one.
+- A field map is read one line at a time. When an entry is split across two source lines, the
+  ordinary rules judge each half, so only the first path on each line is reported.
+- An install path assembled from separate pieces, such as
+  `os.path.join(root, "ArcToolbox", "Toolboxes", "x.tbx")`, has no separator inside any one
+  string, so the install-tree rule does not see it.
 - A shapefile whose sidecars disagree about the case of the name, `ROADS.SHP` beside `roads.prj`,
   is counted as two datasets and reported incomplete. Extensions are matched without regard to
   case; the name before the extension is not.

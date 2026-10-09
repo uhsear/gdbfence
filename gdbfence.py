@@ -18,6 +18,10 @@ one dataset, or of a sidecar file set that is only valid complete. This tool
 adds those two shapes and nothing else. Credential scanning stays with gitleaks
 and detect-secrets, which do it properly.
 
+It also reads scripts and CIM documents for paths that exist on one machine
+only: a drive letter, a UNC share, a per-user connection folder, a toolbox in
+the ArcGIS install tree, and every input path inside a serialized field map.
+
     python gdbfence.py --self-test
     python gdbfence.py --staged
     python gdbfence.py data/ layers/
@@ -128,6 +132,36 @@ UNC_RE = re.compile(r"""(?:^|[\s"'=(\[,:])(\\{2,4}[A-Za-z0-9._$-]+\\)""")
 # estate: 279 files name the folder and 56 of them held a connection path that
 # no other rule here reported.
 CONNECTION_FOLDER_RE = re.compile(r"Database Connections[\\/]", re.I)
+
+# A toolbox inside the ArcGIS install tree. ArcMap kept its system toolboxes
+# under ArcGIS\Desktop10.x\ArcToolbox\Toolboxes and ArcGIS Pro keeps them under  # gdbfence: allow
+# ArcGIS\Pro\Resources\ArcToolbox\toolboxes. A script that hands either one to  # gdbfence: allow
+# AddToolbox runs only where that one release is installed, at that one path.
+# Pro 3.6 spells the folder ArcToolBox on disk. The match ignores case, because
+# Windows does.
+#
+# The drive letter is not the defect here, and often there is none: the path is
+# built from os.environ["ProgramFiles(x86)"] or %ProgramFiles%, which DRIVE_RE
+# cannot see. The install tree itself is the defect. Esri's ImportToolbox
+# reference says the core toolboxes are accessible in a script by default, so
+# the line is not needed at all. The optional prefix only makes the message
+# name the release, such as Desktop10.8.
+INSTALL_TREE_RE = re.compile(
+    r"(?:ArcGIS[\\/]+[^\\/\"',;]+[\\/]+(?:Resources[\\/]+)?)?"
+    r"ArcToolbox[\\/]+Toolboxes[\\/]", re.I)
+
+# One entry of a serialized field map, as FieldMappings.exportToString writes it
+# and as ModelBuilder exports it into a script:
+#
+#     NAME "NAME" true true false 50 Text 0 0,First,#,<input path>,NAME,0,49
+#
+# The merge rules are the ones the FieldMap reference lists. Group 1 is the
+# input path. One Append call can carry hundreds of these entries in a single
+# string of several thousand characters. The scan below reports only the FIRST
+# path on a line, so every later input path in that string was invisible: the
+# report named one share, and a reviewer scrolling the line saw none.
+FIELD_MAP_RE = re.compile(
+    r",(?:First|Last|Join|Min|Max|Mean|Median|Sum|StDev|Count),[^,;]*,([^,;]*)")
 
 # A path made only of these characters needs no quoting in the printed
 # filter-repo command. Anything else is double quoted. GIS paths have spaces in
@@ -367,6 +401,8 @@ def strip_python_prose(text):
     for (srow, scol), (erow, ecol) in spans:
         for row in range(srow, erow + 1):
             if row - 1 >= len(lines):
+                # ponytail: defensive, never reached. No probed input gave a
+                # token span past the last line, so coverage marks it missed.
                 break
             line = lines[row - 1]
             begin = scol if row == srow else 0
@@ -378,6 +414,43 @@ def strip_python_prose(text):
             prose[row - 1] = (prose[row - 1][:begin] + line[begin:finish]
                               + prose[row - 1][finish:])
     return chr(10).join(code), chr(10).join(prose)
+
+
+def path_root(path):
+    """The non-portable root of one bare path, or None when it is portable.
+
+    A UNC root is respelled as two backslashes, the host and one backslash, so
+    the same share counts once whether the source escaped it or not.
+    """
+    p = path.strip().strip("\"'")
+    m = UNC_RE.match(p)
+    if m:
+        return "\\\\%s\\" % m.group(1).strip("\\").lower()
+    m = DRIVE_RE.match(p)
+    if m:
+        return m.group(0).upper()
+    m = CONNECTION_FOLDER_RE.match(p)
+    if m:
+        return m.group(0)
+    return None
+
+
+def field_map_paths(line):
+    """(non-portable roots, line) for every field map input path on one line.
+
+    Each root comes back once per input path that has it, in order. The line
+    comes back with those input paths blanked to spaces, so the ordinary rules
+    still judge everything else on it and never report one of them twice.
+    """
+    roots = []
+    for m in FIELD_MAP_RE.finditer(line):
+        root = path_root(m.group(1))
+        if root is None:
+            continue
+        roots.append(root)
+        begin, finish = m.span(1)
+        line = line[:begin] + " " * (finish - begin) + line[finish:]
+    return roots, line
 
 
 def scan_text(path, text):
@@ -401,6 +474,29 @@ def scan_text(path, text):
         # the only thing there is to read.
         if line_no <= len(waiver_lines) and ALLOW_RE.search(
                 waiver_lines[line_no - 1]):
+            continue
+        roots, line = field_map_paths(line)
+        if roots:
+            tally = []
+            for root in roots:
+                if root not in tally:
+                    tally.append(root)
+            findings.append(Finding(
+                NON_PORTABLE_PATH, path,
+                "line %d holds a field map with %d input path(s) that resolve "
+                "on one network or machine only: %s"
+                % (line_no, len(roots), ", ".join(
+                    "%d under %s" % (roots.count(r), r) for r in tally))))
+        # Checked first, because an install path often carries a drive letter
+        # too, and "only resolves on the machine that wrote it" is the wrong
+        # diagnosis for a path that exists wherever that release is installed.
+        m = INSTALL_TREE_RE.search(line)
+        if m:
+            findings.append(Finding(
+                NON_PORTABLE_PATH, path,
+                "line %d holds the ArcGIS install-tree path \"%s\", which exists "
+                "only where that ArcGIS release is installed. The core toolboxes "
+                "need no AddToolbox" % (line_no, m.group(0))))
             continue
         m = DRIVE_RE.search(line)
         if m:
@@ -938,6 +1034,153 @@ def self_test():
     check(len(both) == 1 and "absolute path" in both[0].message,
           "a line carrying both keeps the drive letter message, and reports once")
 
+    # ---- a toolbox in the ArcGIS install tree. Built from an environment
+    # variable it carries no drive letter, so DRIVE_RE never saw it and the
+    # line scanned clean on every machine that does not have that release.
+    desk = (bs + "ArcGIS" + bs + "Desktop10.8" + bs + "ArcToolbox" + bs
+            + "Toolboxes" + bs + "Data Management Tools.tbx")
+    env_line = ('arcpy.AddToolbox(os.environ["ProgramFiles(x86)"] + r"'
+                + desk + '")')
+    f = scan_text("etl.py", env_line)
+    check(codes(f) == [NON_PORTABLE_PATH],
+          "an install-tree toolbox built from an environment variable is "
+          "non-portable  <-- pinned defect")
+    check("Desktop10.8" in f[0].message and "line 1" in f[0].message,
+          "the report names the release and the line")
+    check("need no AddToolbox" in f[0].message,
+          "and says the core toolboxes need no AddToolbox at all")
+    pro = ("C:" + bs + "Program Files" + bs + "ArcGIS" + bs + "Pro" + bs
+           + "Resources" + bs + "ArcToolBox" + bs + "toolboxes" + bs
+           + "Analysis Tools.tbx")
+    f = scan_text("etl.py", 'arcpy.AddToolbox(r"' + pro + '")')
+    check(len(f) == 1 and "install-tree" in f[0].message
+          and "absolute path" not in f[0].message,
+          "a Pro install path with a drive letter reports once, as an install "
+          "path and not as a machine-local one")
+    check("Pro" + bs + "Resources" + bs + "ArcToolBox" in f[0].message,
+          "the Pro 3.6 spelling on disk, ArcToolBox, is matched with its "
+          "Resources folder")
+    check(codes(scan_text("etl.py", 'tbx = "ArcGIS/Pro/Resources/ArcToolbox/'
+                                    'toolboxes/Analysis Tools.tbx"'))
+          == [NON_PORTABLE_PATH],
+          "the forward slash spelling is caught too")
+    check(codes(scan_text("tools.json", '{"tbx": "ArcToolbox' + bs * 2
+                          + 'Toolboxes' + bs * 2 + 'x.tbx"}'))
+          == [NON_PORTABLE_PATH],
+          "a json-escaped install path is caught too")
+    check(codes(scan_text("run.bat", "set TBX=%ProgramFiles%" + bs + "ArcGIS"
+                          + bs + "Pro" + bs + "Resources" + bs + "ArcToolbox"
+                          + bs + "toolboxes" + bs + "x.tbx"))
+          == [NON_PORTABLE_PATH],
+          "a batch file naming the install tree through %ProgramFiles% is caught")
+    check(scan_text("a.py", "# AddToolbox from ArcToolbox" + bs + "Toolboxes"
+                    + bs + " is not needed in Pro") == [],
+          "an install-tree path inside a python comment is not flagged  <-- pinned defect")
+    check(scan_text("etl.py", 'arcpy.AddToolbox("./tools/qa_checks.atbx")') == [],
+          "a custom toolbox at a relative path is fine")
+    check(scan_text("notes.md", "the ArcToolbox Toolboxes folder") == [],
+          "the folder NAMES without a path separator are prose, not a path")
+    check(scan_text("etl.py", env_line + "  # gdbfence: allow") == [],
+          "the waiver covers the install-tree rule like every other content rule")
+    check(removable_paths(scan_text("etl.py", env_line)) == [],
+          "an install-tree path is NOT offered to filter-repo, you delete the line")
+
+    # ---- non-portable paths inside a serialized field map. One Append call can
+    # carry a field map of several thousand characters, and the scan reported
+    # only the FIRST path on a line. 55 input paths on one share and 1 on a
+    # second share read as one finding naming the first share.
+    def fm_entry(name, src):
+        # The shape FieldMappings.exportToString writes, copied from a real
+        # call under ArcGIS Pro 3.6 against a synthetic feature class.
+        return '%s "%s" true true false 50 Text 0 0,First,#,%s,%s,0,49' % (
+            name, name, src, name)
+
+    def unc(host):
+        return bs * 2 + host + bs + "share" + bs + "a.gdb" + bs + "roads"
+
+    def append_line(entries, first="in_fc"):
+        return ('arcpy.management.Append("%s", "out_fc", "NO_TEST", r\''
+                % first + ";".join(entries) + "')")
+
+    many = [fm_entry("F%03d" % i, unc("filesrv01")) for i in range(55)]
+    long_line = append_line(many + [fm_entry("OWNER", unc("filesrv02"))])
+    check(len(long_line) > 4000,
+          "the fixture is one line of more than 4,000 characters")
+    f = scan_text("etl.py", long_line)
+    check(len(f) == 1 and "field map with 56 input path(s)" in f[0].message,
+          "every input path in a long field map is counted, not just the "
+          "first  <-- pinned defect")
+    check("55 under " + bs * 2 + "filesrv01" + bs in f[0].message
+          and "1 under " + bs * 2 + "filesrv02" + bs in f[0].message,
+          "the second share, hidden behind the first, is named  <-- pinned defect")
+    # A drive letter early in the string used to win the line, so the shares
+    # after it were never reported at all.
+    hidden = append_line([fm_entry("A", "C:" + bs + "scratch" + bs + "a.gdb"
+                                   + bs + "roads")]
+                         + [fm_entry("B%d" % i, unc("filesrv02"))
+                            for i in range(3)])
+    f = scan_text("etl.py", hidden)
+    check(len(f) == 1 and "1 under C:" + bs in f[0].message
+          and "3 under " + bs * 2 + "filesrv02" + bs in f[0].message,
+          "shares hidden behind an earlier drive letter are counted  <-- pinned defect")
+    portable = append_line([fm_entry("NAME", "roads_lyr"),
+                            fm_entry("ID", "./data/a.gdb/roads")])
+    check(scan_text("etl.py", portable) == [],
+          "a field map whose inputs are layers or relative paths is fine")
+    outside = append_line([fm_entry("NAME", "roads_lyr")],
+                          first="D:/gis/in.gdb/roads")  # gdbfence: allow
+    f = scan_text("etl.py", outside)
+    check(len(f) == 1 and "absolute path" in f[0].message,
+          "a path OUTSIDE a portable field map is still judged by the "
+          "ordinary rules")
+    f = scan_text("etl.py", append_line([fm_entry("NAME", unc("filesrv01"))],
+                                        first="D:/gis/in.gdb/roads"))  # gdbfence: allow
+    check(len(f) == 2 and "field map with 1" in f[0].message
+          and "absolute path" in f[1].message,
+          "a bad field map AND a bad path beside it are two findings, the share "
+          "is not reported twice")
+    f = scan_text("etl.py", append_line([
+        fm_entry("A", unc("filesrv01")),
+        fm_entry("B", bs * 4 + "FILESRV01" + bs * 2 + "share" + bs * 2 + "x"),
+    ]))
+    check(len(f) == 1 and "2 under " + bs * 2 + "filesrv01" + bs in f[0].message,
+          "an escaped or upper-case spelling of the same share counts as that "
+          "share")
+    f = scan_text("etl.py", append_line([
+        fm_entry("A", "Database Connections" + bs + "prod.sde" + bs + "roads")]))
+    check(len(f) == 1 and "1 under Database Connections" in f[0].message,
+          "a connection folder input path is counted in the field map too")
+    check(codes(scan_text("etl.py", append_line([
+        fm_entry("A", unc("filesrv01")).replace(",First,", ",Mean,")])))
+        == [NON_PORTABLE_PATH], "another documented merge rule is read as a field map")
+    f = scan_text("etl.py", append_line([
+        fm_entry("A", unc("filesrv01")).replace(",First,", ",Bogus,")]))
+    check(len(f) == 1 and "field map" not in f[0].message
+          and "UNC path" in f[0].message,
+          "an undocumented merge rule is not a field map, so the ordinary UNC "
+          "rule reports it")
+    check(scan_text("a.py", "# fm = '" + fm_entry("A", unc("filesrv01")) + "'")
+          == [],
+          "a field map inside a python comment is not flagged  <-- pinned defect")
+    check(scan_text("etl.py", long_line + "  # gdbfence: allow") == [],
+          "the waiver covers the field map rule like every other content rule")
+    check(removable_paths(scan_text("etl.py", long_line)) == [],
+          "a field map is NOT offered to filter-repo, you edit the line")
+    # Two characterisation tests, not wishes. The README names both under Limits.
+    split = ("fm = ('NAME \"NAME\" true true false 50 Text 0 0,First,#,'" + chr(10)
+             + "      '" + unc("filesrv01") + ",NAME,0,49;ID \"ID\" true true "
+             "false 4 Long 0 0,First,#,'" + chr(10)
+             + "      '" + unc("filesrv02") + ",ID,0,49')")
+    f = scan_text("etl.py", split)
+    check(len(f) == 2 and "field map" not in f[0].message + f[1].message,
+          "a field map split across source lines is judged line by line by the "
+          "ordinary rules")
+    check(scan_text("etl.py", 'tbx = os.path.join(root, "ArcToolbox", '
+                              '"Toolboxes", "x.tbx")') == [],
+          "an install path assembled from separate pieces is not seen")
+    check(path_root(" 'roads_lyr' ") is None and path_root("C:/x") == "C:/",  # gdbfence: allow
+          "a portable input path has no root, a drive letter is its own root")
+
     # ---- prose in python source is documentation, not a hardcoded path
     check(scan_text("a.py", "# look for C:" + chr(92) + " helps nobody") == [],
           "a drive letter inside a python comment is not flagged  <-- pinned defect")
@@ -1103,6 +1346,8 @@ def self_test():
               "an unreadable GDBFENCE_MAX_DATASET_SIZE exits 2, not a traceback")
     finally:
         os.environ.pop("GDBFENCE_MAX_DATASET_SIZE", None)
+        # ponytail: the self-test sets the variable itself just above, so the
+        # False branch here is only taken by a hand edit. Coverage marks it.
         if saved_env is not None:
             os.environ["GDBFENCE_MAX_DATASET_SIZE"] = saved_env
     check(os.environ.get("GDBFENCE_MAX_DATASET_SIZE") == "7MB",
@@ -1296,6 +1541,8 @@ def self_test():
         # the \\?\ prefix is listed by os.walk and then not found by
         # os.path.getsize. One unreadable file must not take the audit down
         # with it, and it must not be counted as a zero either.
+        # ponytail: one branch per platform, so each host's coverage run marks
+        # the other branch missed. The Linux run covers the else branch.
         if os.name == "nt":
             odd_dir = os.path.join(tmp, "odd")
             odd = os.path.join(odd_dir, "trailing ")
@@ -1391,6 +1638,15 @@ def self_test():
 
         check(capture(lambda: main([me, "--no-history"]))[0] == 0,
               "gdbfence scans its own source clean  <-- pinned defect")
+
+        # Both one-machine path rules, end to end, from a script on disk.
+        etl = os.path.join(tmp, "scripts", "nightly_append.py")
+        write(etl, (env_line + chr(10) + long_line + chr(10)).encode("ascii"))
+        rc, out = capture(lambda: main([etl, "--no-history"]))
+        check(rc == 1 and "line 1 holds the ArcGIS install-tree path" in out,
+              "a script on disk with an install-tree AddToolbox is refused")
+        check("line 2 holds a field map with 56 input path(s)" in out,
+              "and its 4,000-character field map is counted in the same run")
 
         # ---- --staged reads the index, not the working tree
         staged_lyrx = os.path.join(repo, "layer.lyrx")
@@ -1500,6 +1756,8 @@ def self_test():
                 # A dangling symlink has no target to chmod, and os.walk lists it
                 # among the names. Letting that raise took the whole teardown down
                 # and leaked the fixture directory.
+                # ponytail: the self-test removes its own symlink first, so
+                # this skip is reached only when an assertion above fails.
                 if os.path.islink(target) or not os.path.exists(target):
                     continue
                 os.chmod(target, 0o600)
@@ -1509,6 +1767,8 @@ def self_test():
 
     print("-" * 68)
     total = passed[0] + len(failed)
+    # ponytail: reached only by a failing run. The harness probe above proves
+    # check() records failures; a green run cannot also take this branch.
     if failed:
         print("%d assertions, %d failed" % (total, len(failed)))
         for f in failed:
@@ -1524,7 +1784,8 @@ def _parse(argv):
     ap = argparse.ArgumentParser(
         prog="gdbfence.py",
         description="Refuse the commit that puts a File Geodatabase, a "
-                    "shapefile missing its .prj, or a drive letter into git.",
+                    "shapefile missing its .prj, or a path that exists on one machine "
+                    "only into git.",
         epilog="Nothing is written without --apply, and the filter-repo "
                "command is printed, never run.",
         allow_abbrev=False,
