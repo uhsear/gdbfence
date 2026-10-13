@@ -39,6 +39,7 @@ import io
 import os
 import tokenize
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -71,10 +72,18 @@ SHAPEFILE_SIDECARS = (".shp", ".shx", ".dbf", ".prj", ".cpg", ".sbn", ".sbx",
 # shapefile with no .prj carries no CRS at all, and the reader guesses.
 SHAPEFILE_REQUIRED = (".shx", ".dbf", ".prj")
 
-# Things that should essentially never be in a git history. .lock is an active
-# ArcGIS editing lock, so committing one commits a private lock nobody else can
-# clear.
-NEVER_COMMIT = (".gdb", ".sde", ".lock", ".mdb", ".gdbindexes")
+# Things that should essentially never be in a git history.
+NEVER_COMMIT = (".gdb", ".sde", ".mdb", ".gdbindexes")
+
+# An ArcGIS lock file. Esri's file geodatabase locking page says ArcGIS places
+# *.lock files in the geodatabase folder and names one like
+# xxx.PLUTO.15332.sr.lock, with the computer name inside. The lock types are
+# sr, rd, wr and ed. A bare ".lock" suffix is NOT enough: Cargo.lock,
+# poetry.lock, yarn.lock and Pipfile.lock are ordinary dependency pins that
+# every repository with Python, Rust or JavaScript should commit. So a file is
+# a lock of ours only when the name carries a lock type or a GIS dataset
+# extension just before .lock, as in parcels.gdb.lock.
+LOCK_RE = re.compile(r"\.(?:sr|rd|wr|ed|gdb|mdb|shp|dbf)\.lock$")
 
 # Only these are opened and read for non-portable paths. .lyrx and .mapx are
 # CIM documents, which are JSON, and they are where hard-coded drive letters
@@ -128,9 +137,9 @@ UNC_RE = re.compile(r"""(?:^|[\s"'=(\[,:])(\\{2,4}[A-Za-z0-9._$-]+\\)""")
 # of these scans clean. It is not portable: ArcGIS resolves it against
 # %APPDATA%\ESRI\Desktop10.x\ArcCatalog in ONE user profile. The build agent has  # gdbfence: allow
 # no such folder and neither does the service account, so the job runs at the
-# desk it was written at and nowhere else. Measured over a 743-file legacy
-# estate: 279 files name the folder and 56 of them held a connection path that
-# no other rule here reported.
+# desk it was written at and nowhere else. In a legacy script estate many files
+# name the folder, and some of them held a connection path that no other rule
+# here reported.
 CONNECTION_FOLDER_RE = re.compile(r"Database Connections[\\/]", re.I)
 
 # A toolbox inside the ArcGIS install tree. ArcMap kept its system toolboxes
@@ -160,8 +169,15 @@ INSTALL_TREE_RE = re.compile(
 # string of several thousand characters. The scan below reports only the FIRST
 # path on a line, so every later input path in that string was invisible: the
 # report named one share, and a reviewer scrolling the line saw none.
+#
+# The field after the merge rule is the Join delimiter. It is "#" for every
+# other rule, but ArcGIS Pro 3.6 writes a Join delimiter in double quotes, as in
+# Join,", ",<path>, and the quoted text can hold a comma or a semicolon. The
+# quoted form is tried first, with an optional run of backslashes in front of
+# each quote for a string that escaped them.
 FIELD_MAP_RE = re.compile(
-    r",(?:First|Last|Join|Min|Max|Mean|Median|Sum|StDev|Count),[^,;]*,([^,;]*)")
+    r",(?:First|Last|Join|Min|Max|Mean|Median|Sum|StDev|Count),"
+    r'(?:\\*"[^"]*"|[^,;]*),([^,;]*)')
 
 # A path made only of these characters needs no quoting in the printed
 # filter-repo command. Anything else is double quoted. GIS paths have spaces in
@@ -173,13 +189,17 @@ SAFE_PATH_RE = re.compile(r"^[A-Za-z0-9._/@=+-]+$")
 class Finding(object):
     """One thing wrong with one dataset, plus the path filter-repo would take."""
 
-    def __init__(self, code, path, message, remedy_path=None):
+    def __init__(self, code, path, message, remedy_path=None,
+                 remedy_paths=None):
         self.code = code
         self.path = path
         self.message = message
         # What git filter-repo needs, which is the .gdb directory rather than
         # the 340 files inside it.
         self.remedy_path = remedy_path or path
+        # A shapefile is a stem, which is not a path git knows. Its remedy is
+        # every member file, so this can hold several.
+        self.remedy_paths = tuple(remedy_paths or (self.remedy_path,))
 
     def __repr__(self):
         return "Finding(%s, %r)" % (self.code, self.path)
@@ -319,6 +339,11 @@ def audit(entries, max_dataset_size=DEFAULT_MAX_DATASET_SIZE, ignore=(),
             findings.append(Finding(
                 NEVER_COMMIT_CODE, key,
                 "%s files should never be committed" % splitext_gis(key)[1]))
+        elif ds["kind"] == "file" and LOCK_RE.search(key.lower()):
+            findings.append(Finding(
+                NEVER_COMMIT_CODE, key,
+                "an ArcGIS lock file should never be committed, it names a "
+                "private process nobody else can clear"))
 
         # Dataset-shaped size. The per-file figure rides along in the message
         # because the whole point is that per-file checking saw nothing wrong.
@@ -333,7 +358,9 @@ def audit(entries, max_dataset_size=DEFAULT_MAX_DATASET_SIZE, ignore=(),
                 BIG_DATASET, key,
                 "one dataset of %d file(s) totalling %s, over the %s limit%s"
                 % (len(ds["files"]), human_size(ds["total"]),
-                   human_size(max_dataset_size), note)))
+                   human_size(max_dataset_size), note),
+                remedy_paths=[p for p, _size in ds["files"]]
+                if ds["kind"] == "shapefile" else None))
 
         # A shapefile is only a dataset when it is complete.
         if ds["kind"] == "shapefile" and ".shp" in ds["exts"]:
@@ -459,12 +486,15 @@ def scan_text(path, text):
     Kept apart from audit() so the size and completeness rules never need a file
     to be readable, and so this one is testable against a string literal.
     """
-    waiver_lines = text.splitlines()
+    # Split on newline only. str.splitlines() also breaks at a form feed, a
+    # vertical tab and U+2028, while strip_python_prose() splits on newline, so
+    # one such character shifted every waiver below it onto the wrong line.
+    waiver_lines = text.split(chr(10))
     if path.lower().endswith((".py", ".pyt")):
         text, prose = strip_python_prose(text)
-        waiver_lines = prose.splitlines()
+        waiver_lines = prose.split(chr(10))
     findings = []
-    for line_no, line in enumerate(text.splitlines(), 1):
+    for line_no, line in enumerate(text.split(chr(10)), 1):
         # The waiver is NOT read from the line being scanned. The stripper has
         # already erased the comment carrying it by this point, so checking the
         # stripped line finds nothing and the waiver silently does not work.
@@ -526,7 +556,8 @@ def scan_text(path, text):
 
 def removable_paths(findings):
     """The dataset paths whose problem removal actually solves."""
-    return sorted(set(f.remedy_path for f in findings if f.code in REMOVABLE))
+    return sorted(set(p for f in findings if f.code in REMOVABLE
+                      for p in f.remedy_paths))
 
 
 def quote_path(path):
@@ -579,24 +610,49 @@ def sh_quote(text):
     return "'" + text.replace("'", "'" + chr(92) + "''") + "'"
 
 
+def hook_command(tool_path, executable=None):
+    """The shell command line the git hook runs, quoted for /bin/sh."""
+    return "%s %s --staged" % (sh_quote(hook_interpreter(executable)),
+                               sh_quote(tool_path))
+
+
 def hook_script(tool_path, executable=None):
     """The plain git pre-commit hook, as text."""
     return ("#!/bin/sh" + chr(10)
             + "# Installed by gdbfence --install. Delete this file to remove it."
             + chr(10)
-            + "exec %s %s --staged" % (sh_quote(hook_interpreter(executable)),
-                                       sh_quote(tool_path))
+            + "exec " + hook_command(tool_path, executable)
             + chr(10))
+
+
+def entry_word(text):
+    """One word of a pre-commit entry, quoted for shlex.split.
+
+    pre-commit runs shlex.split(entry) and executes the result with no shell
+    (hook_cmd in pre_commit/lang_base.py). An unquoted interpreter path with a
+    space in it, such as the default ArcGIS Pro one, therefore starts as a
+    different program. Backslashes are respelled as forward slashes first,
+    because shlex reads a backslash as an escape and Windows accepts both.
+    """
+    text = text.replace(chr(92), "/")
+    if SAFE_PATH_RE.match(text):
+        return text
+    return '"%s"' % text.replace('"', chr(92) + '"')
 
 
 def precommit_entry(tool_path, executable=None):
     """The .pre-commit-config.yaml block, as text."""
+    command = "%s %s --staged" % (entry_word(hook_interpreter(executable)),
+                                  entry_word(tool_path))
+    if '"' in command:
+        # A YAML plain scalar cannot start with a quote, and the double quotes
+        # inside would end it early. Single quotes keep every character literal.
+        command = "'%s'" % command.replace("'", "''")
     return ("-   repo: local" + chr(10)
             + "    hooks:" + chr(10)
             + "    -   id: gdbfence" + chr(10)
             + "        name: gdbfence" + chr(10)
-            + "        entry: %s %s --staged" % (hook_interpreter(executable),
-                                                 tool_path) + chr(10)
+            + "        entry: %s" % command + chr(10)
             + "        language: system" + chr(10)
             + "        pass_filenames: false" + chr(10))
 
@@ -650,31 +706,46 @@ def staged_entries():
     return entries
 
 
-def walk_entries(paths):
+def walk_entries(paths, unreadable=None, walker=os.walk):
     """(path, size) for the command line arguments, walking any directory.
 
     main refuses a path that does not exist before calling this, so os.walk
     over a missing directory yielding nothing is not a silent pass here.
+
+    A directory the walk cannot enter and a file it cannot measure are skipped,
+    and each one is appended to UNREADABLE when a list is passed. The caller
+    decides what an audit that could not look at something may claim. WALKER is
+    a seam for the self-test, which cannot count on a permission being denied.
     """
     entries = []
+
+    def failed(exc):
+        if unreadable is not None:
+            unreadable.append(exc.filename)
+
     for arg in paths:
         if os.path.isfile(arg):
             entries.append((arg, os.path.getsize(arg)))
             continue
-        for root, dirs, files in os.walk(arg):
+        for root, dirs, files in walker(arg, onerror=failed):
             if ".git" in dirs:
                 dirs.remove(".git")
             for name in files:
                 full = os.path.join(root, name)
                 try:
                     entries.append((full, os.path.getsize(full)))
-                except OSError:
-                    pass
+                except OSError as exc:
+                    exc.filename = full
+                    failed(exc)
     return entries
 
 
-def document_text(path, size, staged=False):
+def document_text(path, size, staged=False, unreadable=None):
     """The text of a document worth scanning, or None. Never raises on binary.
+
+    None also means "skipped on purpose": too big, not a document suffix, or a
+    NUL byte. A document that SHOULD have been read and could not be is the
+    other kind, and its path is appended to UNREADABLE when a list is passed.
 
     With --staged this reads the INDEX, not the working tree. A hook that reads
     the working tree is walked straight past: stage the .lyrx with the drive
@@ -692,10 +763,16 @@ def document_text(path, size, staged=False):
             with open(path, "rb") as fh:
                 text = fh.read().decode("utf-8", "replace")
         except (OSError, IOError):
-            return None
-    if text is None or "\x00" in text:
+            text = None
+    if text is None:
+        if unreadable is not None:
+            unreadable.append(path)
         return None
-    return text
+    if "\x00" in text:
+        return None
+    # A UTF-8 byte order mark sits in front of the first line and hid a UNC path
+    # there, since the leading-delimiter class of UNC_RE has no BOM in it.
+    return text.lstrip(chr(0xFEFF))
 
 
 def in_history(path):
@@ -720,8 +797,8 @@ def install(tool_path, apply_it):
 
     if os.path.exists(hook):
         print("error: %s already exists. Refusing to overwrite it. Add this "
-              "line to it yourself:\n  python %s --staged"
-              % (hook, tool_path), file=sys.stderr)
+              "line to it yourself:\n  %s" % (hook, hook_command(tool_path)),
+              file=sys.stderr)
         return 2
     if not apply_it:
         print("Would write %s. Re-run with --apply to write it." % hook)
@@ -748,6 +825,22 @@ def install(tool_path, apply_it):
 
 # ------------------------------------------------------------------ self-test
 
+def take_env():
+    """Remove and return every variable that could steer the self-test's git.
+
+    GIT_DIR, GIT_INDEX_FILE and GIT_WORK_TREE are set when this runs from a git
+    hook, from git rebase -x or from git bisect run. Left in place, the throwaway
+    repository's init, config and commit steps act on the CALLER's repository
+    instead: they rewrote its user.name and added a commit. The tool's own
+    GDBFENCE_MAX_DATASET_SIZE would change the size assertions the same way.
+    """
+    taken = {}
+    for key in list(os.environ):
+        if key.startswith("GIT_") or key == "GDBFENCE_MAX_DATASET_SIZE":
+            taken[key] = os.environ.pop(key)
+    return taken
+
+
 def self_test():
     """Assertions over the decision core, then over the io layer.
 
@@ -756,6 +849,7 @@ def self_test():
     inside it, because the hook, the read from the index and the printed
     filter-repo remedy cannot be tested any other way.
     """
+    held = take_env()
     passed = [0]
     failed = []
 
@@ -977,6 +1071,27 @@ def self_test():
           "and so is a .gdbindexes directory, as one dataset")
     check(codes(audit([("notes.txt", 10)])) == [],
           "an ordinary text file is not refused")
+    # A bare .lock suffix refused Cargo.lock, poetry.lock and yarn.lock, which
+    # every repository with Python, Rust or JavaScript commits on purpose.
+    check(audit([("Cargo.lock", 10), ("poetry.lock", 10), ("yarn.lock", 10),
+                 ("Pipfile.lock", 10), ("app/package.lock", 10)]) == [],
+          "a dependency lock file is not an ArcGIS lock  <-- pinned defect")
+    for kind in ("sr", "rd", "wr", "ed", "gdb", "mdb", "shp", "dbf"):
+        check(codes(audit([("data/Parcels.TESTPC.7724.1439.%s.lock" % kind,
+                            10)])) == [NEVER_COMMIT_CODE],
+              "an ArcGIS %s lock file is still refused" % kind)
+    check(codes(audit([("data/PARCELS.TESTPC.7724.SR.LOCK", 10)]))
+          == [NEVER_COMMIT_CODE],
+          "the lock file rule folds case, as Windows does")
+    check(codes(audit([("data/x.gdb/a.TESTPC.1.2.sr.lock", 10)]))
+          == [NEVER_COMMIT_CODE],
+          "a lock file inside a .gdb is one finding for the .gdb, not two")
+    shp_set = [("data/roads" + e, 600000) for e in (".shp", ".dbf", ".shx", ".prj")]
+    check(removable_paths(audit(shp_set, max_dataset_size=1000000))
+          == ["data/roads.dbf", "data/roads.prj", "data/roads.shp",
+              "data/roads.shx"],
+          "an oversize shapefile is offered to filter-repo by its member files, "
+          "since its stem is no path git knows  <-- pinned defect")
 
     # ---- non-portable paths in text and CIM documents
     cim = ('{"dataConnection": {"workspaceConnectionString": '
@@ -1159,6 +1274,46 @@ def self_test():
           and "UNC path" in f[0].message,
           "an undocumented merge rule is not a field map, so the ordinary UNC "
           "rule reports it")
+    # Every rule the FieldMap reference lists, written out LITERALLY. Looping
+    # over the regex would only ever test what it already holds: dropping Count
+    # from FIELD_MAP_RE left an earlier version of this self-test green.
+    for rule in ("First", "Last", "Join", "Min", "Max", "Mean", "Median", "Sum",
+                 "StDev", "Count"):
+        f = scan_text("etl.py", append_line([
+            fm_entry("A", unc("filesrv01")).replace(",First,", "," + rule + ","),
+            fm_entry("B", unc("filesrv02"))]))
+        check(len(f) == 1 and "field map with 2 input path(s)" in f[0].message
+              and "1 under " + bs * 2 + "filesrv02" + bs in f[0].message,
+              "the %s merge rule is read as a field map, so the share behind "
+              "it is named  <-- pinned defect" % rule)
+
+    # ArcGIS Pro 3.6 writes a Join delimiter in double quotes, and the text can
+    # hold a comma or a semicolon. The delimiter field used to stop at the
+    # first comma, so the Join entry was no field map entry at all and the
+    # second share on the line was never named.
+    def join_entry(src, delim):
+        return ('A "A" true true false 50 Text 0 0,Join,%s,%s,A,0,49'
+                % (delim, src))
+
+    for label, delim in (("comma and space", '", "'), ("comma", '","'),
+                         ("semicolon", '";"'),
+                         ("comma and space inside escaped quotes",
+                          bs + '", ' + bs + '"')):
+        f = scan_text("etl.py", append_line([
+            join_entry(unc("filesrv01"), delim),
+            join_entry(unc("filesrv02"), delim)]))
+        check(len(f) == 1 and "field map with 2 input path(s)" in f[0].message
+              and "1 under " + bs * 2 + "filesrv01" + bs in f[0].message
+              and "1 under " + bs * 2 + "filesrv02" + bs in f[0].message,
+              "a Join delimiter of %s does not hide the second share  "
+              "<-- pinned defect" % label)
+    f = scan_text("etl.py", append_line([
+        join_entry(unc("filesrv01"), '", "'),
+        join_entry(unc("filesrv02"), '", "'),
+        fm_entry("C", unc("filesrv03"))]))
+    check(len(f) == 1 and "field map with 3 input path(s)" in f[0].message
+          and "filesrv03" in f[0].message and "filesrv02" in f[0].message,
+          "two Join entries and a First entry are three paths on three shares  <-- pinned defect")
     check(scan_text("a.py", "# fm = '" + fm_entry("A", unc("filesrv01")) + "'")
           == [],
           "a field map inside a python comment is not flagged  <-- pinned defect")
@@ -1199,6 +1354,12 @@ def self_test():
           "unparseable python falls back to a raw scan")
     check(codes(scan_text("notes.md", "see C:/Users/jdoe")) == [NON_PORTABLE_PATH],  # gdbfence: allow
           "a non-python file is not prose-stripped")
+    # A form feed splits str.splitlines() but not the stripper, which shifted
+    # the waiver comment onto the line above and blessed a real hardcoded path.
+    ff = scan_text("a.py", 'a = 1' + chr(12) + 'b = "C:/x"' + chr(10)  # gdbfence: allow
+                   + 'c = 2  # gdbfence: allow')
+    check(codes(ff) == [NON_PORTABLE_PATH] and "line 1 " in ff[0].message,
+          "a form feed does not move a waiver onto the line above  <-- pinned defect")
 
     # ---- the inline waiver
     check(codes(scan_text("a.py", 'ws = "C:/gis"')) == [NON_PORTABLE_PATH],  # gdbfence: allow
@@ -1382,6 +1543,33 @@ def self_test():
     check("entry: python3 t.py --staged" in precommit_entry("t.py", executable="python3"),
           "the pre-commit entry names the same interpreter")
 
+    def entry_words(executable):
+        """What pre-commit runs: the entry value, YAML-unquoted, shlex-split."""
+        line = [x for x in precommit_entry("gdbfence.py", executable).split(
+            chr(10)) if "entry: " in x][0]
+        value = line.split("entry: ", 1)[1]
+        if value.startswith("'"):
+            value = value[1:-1].replace("''", "'")
+        return shlex.split(value)
+
+    win_py = ("C:" + chr(92) + "Program Files" + chr(92) + "ArcGIS" + chr(92)
+              + "Pro" + chr(92) + "bin" + chr(92) + "Python" + chr(92) + "envs"
+              + chr(92) + "arcgispro-py3" + chr(92) + "python.exe")
+    check(entry_words("python3") == ["python3", "gdbfence.py", "--staged"],
+          "a plain interpreter name needs no quoting at all")
+    check(entry_words(win_py) == ["C:/Program Files/ArcGIS/Pro/bin/Python/envs/"  # gdbfence: allow
+                                  "arcgispro-py3/python.exe", "gdbfence.py",
+                                  "--staged"],
+          "the pre-commit entry keeps an interpreter path with spaces as ONE "
+          "word when pre-commit splits it  <-- pinned defect")
+    check([x for x in precommit_entry("gdbfence.py", win_py).split(chr(10))
+           if "entry: " in x][0].startswith("        entry: '\"C:/Program Files/"),  # gdbfence: allow
+          "and the quoted entry is a YAML single-quoted scalar, since a plain "
+          "scalar cannot start with a quote  <-- pinned defect")
+    check(entry_words("/opt/it's \"x\"/python3")
+          == ["/opt/it's \"x\"/python3", "gdbfence.py", "--staged"],
+          "and a path holding both kinds of quote survives the round trip")
+
     check(hook_script("gdbfence.py").startswith("#!/bin/sh"),
           "the git hook is a shell script")
     check("--staged" in hook_script("gdbfence.py"),
@@ -1408,6 +1596,13 @@ def self_test():
           "check() and raises() really do record a failure  <-- pinned defect")
     check("no error raised" in probe[1] and "wrong exception" in probe[2],
           "and say which way the call under test went wrong")
+
+    # ---- the environment. Taken out at the top of the run, put back at the end.
+    os.environ["GIT_DIR"] = os.path.join(os.getcwd(), "no-such-git-dir")
+    taken = take_env()
+    check("GIT_DIR" not in os.environ and list(taken) == ["GIT_DIR"],
+          "a GIT_DIR from the caller is taken out before any git step runs, so "
+          "the fixture repository is never the caller's  <-- pinned defect")
 
     # ---- the io layer, against a real temporary git repository.
     #
@@ -1512,8 +1707,43 @@ def self_test():
                                   document_text(probe, os.path.getsize(probe))))
                   == [NON_PORTABLE_PATH],
                   "a %s document is read and its drive letter found" % ext)
+        bom = os.path.join(tmp, "unread", "bom.txt")
+        write(bom, bytes(bytearray([0xEF, 0xBB, 0xBF, 92, 92])) + b"srv"
+              + bytes(bytearray([92])) + b"x")
+        check(codes(scan_text("bom.txt",
+                              document_text(bom, os.path.getsize(bom))))
+              == [NON_PORTABLE_PATH],
+              "a UNC path on the first line of a file with a UTF-8 byte order "
+              "mark is seen  <-- pinned defect")
         check(document_text(os.path.join(docs, "no-such-file.json"), 10) is None,
               "a document that cannot be opened is skipped, not fatal")
+        # ... but not silently. A directory named like a document is the
+        # platform-neutral way to make open() fail, since chmod 000 does nothing
+        # on Windows.
+        unread = os.path.join(tmp, "unread", "dir.json")
+        os.makedirs(unread)
+        skipped = []
+        check(document_text(unread, 10, unreadable=skipped) is None
+              and skipped == [unread],
+              "a document that cannot be opened is also reported as unreadable  <-- pinned defect")
+        skipped = []
+        document_text(over, os.path.getsize(over), unreadable=skipped)
+        document_text(os.path.join(docs, "a.gdbtable"), 10, unreadable=skipped)
+        binary = os.path.join(tmp, "unread", "nul.json")
+        write(binary, b"\x00\x01")
+        document_text(binary, 2, unreadable=skipped)
+        check(skipped == [],
+              "files skipped on purpose, too big, not a document or binary, "
+              "are not counted as unreadable")
+
+        def denied_walker(top, onerror):
+            onerror(OSError(13, "denied", top))
+            return iter(())
+
+        skipped = []
+        check(walk_entries(["locked-folder"], skipped, denied_walker) == []
+              and skipped == ["locked-folder"],
+              "a folder the walk cannot enter is reported as unreadable  <-- pinned defect")
 
         # Binary. A .gdbtable renamed to .json, or a CIM file saved by a tool
         # that wrote UTF-16, must not end the whole audit with a traceback.
@@ -1551,6 +1781,10 @@ def self_test():
                   "the fixture really is a file whose name ends in a space")
             check(walk_entries([odd_dir]) == [],
                   "a walked file the platform cannot stat is skipped, not fatal")
+            skipped = []
+            walk_entries([odd_dir], skipped)
+            check(skipped == [odd],
+                  "and is reported as unreadable, not forgotten  <-- pinned defect")
             os.remove("\\\\?\\" + odd)
 
         else:
@@ -1566,6 +1800,10 @@ def self_test():
                   'the fixture really is a file the walker lists')
             check(walk_entries([odd_dir]) == [],
                   'a walked file the platform cannot stat is skipped, not fatal')
+            skipped = []
+            walk_entries([odd_dir], skipped)
+            check(skipped == [odd],
+                  'and is reported as unreadable, not forgotten  <-- pinned defect')
             os.remove(odd)
         rc, out = capture(lambda: main([docs, "--no-history"]))
         check(rc == 1, "auditing that directory refuses it")
@@ -1636,6 +1874,22 @@ def self_test():
         check("filter-repo" not in out,
               "but no history remedy is printed for a path git never saw  <-- pinned defect")
 
+        # A shapefile set over the limit and already in a commit. Its dataset
+        # key is the stem, which git has never heard of, so the remedy used to
+        # be dropped in silence for this one shape.
+        for ext in (".shp", ".dbf", ".shx", ".prj"):
+            write(os.path.join(repo, "shpdata", "roads" + ext), b"\x00" * 600000)
+        run(["git", "add", "-A"], cwd=repo)
+        rc, out = run(["git", "commit", "-qm", "add the shapefile"], cwd=repo)
+        rc, out = capture(lambda: main(["shpdata", "--max-dataset-size", "1MB"]))
+        check(rc == 1 and "BIG_DATASET  shpdata/roads" in out,
+              "an oversize shapefile set is refused as one dataset")
+        check("git filter-repo --invert-paths --force --path shpdata/roads.dbf "
+              "--path shpdata/roads.prj --path shpdata/roads.shp "
+              "--path shpdata/roads.shx" in out,
+              "and the remedy for a shapefile already in history is printed, "
+              "member file by member file  <-- pinned defect")
+
         check(capture(lambda: main([me, "--no-history"]))[0] == 0,
               "gdbfence scans its own source clean  <-- pinned defect")
 
@@ -1683,7 +1937,20 @@ def self_test():
         os.remove(os.path.join(repo, "sub"))
 
         # ---- git is not there to be had
-        os.chdir(tmp)
+        #
+        # When TMPDIR sits inside a work tree, git walks up from the temporary
+        # directory and finds THAT repository, so "outside a repository" was a
+        # repository, and --install --apply wrote a hook into it. The ceiling
+        # stops the walk at the fixture. The decoy stands in for the work tree.
+        decoy = new_repo("decoy")
+        plain = os.path.join(decoy, "plain")
+        os.makedirs(plain)
+        check(git(["rev-parse", "--git-dir"], cwd=plain) is not None,
+              "the fixture really sits inside an outer repository")
+        os.environ["GIT_CEILING_DIRECTORIES"] = decoy
+        check(git(["rev-parse", "--git-dir"], cwd=plain) is None,
+              "GIT_CEILING_DIRECTORIES stops the walk at the fixture  <-- pinned defect")
+        os.chdir(plain)
         check(staged_entries() is None,
               "staged_entries outside a repository returns None, not an empty "
               "list that would read as CLEAN  <-- pinned defect")
@@ -1694,6 +1961,10 @@ def self_test():
         check(rc == 2, "--install outside a repository exits 2")
         check("language: system" in out,
               "and still prints the pre-commit entry, which needs no repository")
+        check(not os.path.exists(os.path.join(decoy, ".git", "hooks",
+                                              "pre-commit")),
+              "and writes no hook into the repository around it  <-- pinned defect")
+        os.environ.pop("GIT_CEILING_DIRECTORIES", None)
 
         # ---- --install
         hookrepo = new_repo("hookrepo")
@@ -1713,6 +1984,9 @@ def self_test():
         check(rc == 2 and read(hook) == hook_script("gdbfence.py"),
               "a second --apply refuses to overwrite the hook and changes nothing")
         check("Refusing to overwrite" in out, "and names the file it left alone")
+        check(sh_quote(hook_interpreter()) in out and "python gdbfence" not in out,
+              "and the line it tells you to add names the interpreter, never a "
+              "bare python  <-- pinned defect")
 
         badrepo = new_repo("badrepo")
         os.chdir(badrepo)
@@ -1722,6 +1996,35 @@ def self_test():
         check(rc == 2, "a hooks path that is not a directory exits 2, not a "
                        "traceback")
         check("could not write" in out, "and names the file it could not write")
+
+        # ---- a staged document git cannot read back. A gitlink whose commit this
+        # repository lacks passes the staged listing and fails git show, which
+        # is how a document that cannot be read looks from the index.
+        unrepo = new_repo("unrepo")
+        os.chdir(unrepo)
+        write(os.path.join(unrepo, "ghost.json"), b"{}")
+        run(["git", "update-index", "--add", "--cacheinfo",
+             "160000,0123456789012345678901234567890123456789,ghost.json"],
+            cwd=unrepo)
+        rc, out = capture(lambda: main(["--staged", "--no-history"]))
+        check(rc == 2 and "VERDICT: UNKNOWN" in out and "ghost.json" in out
+              and "VERDICT: CLEAN" not in out,
+              "a staged document that cannot be read is not a clean pass, exit "
+              "2  <-- pinned defect")
+        for i in range(5):
+            run(["git", "update-index", "--add", "--cacheinfo",
+                 "160000,0123456789012345678901234567890123456789,g%d.json" % i],
+                cwd=unrepo)
+            write(os.path.join(unrepo, "g%d.json" % i), b"{}")
+        write(os.path.join(unrepo, "layer.lyrx"), dirty)
+        run(["git", "add", "layer.lyrx"], cwd=unrepo)
+        rc, out = capture(lambda: main(["--staged", "--no-history"]))
+        check(rc == 1 and "NON_PORTABLE_PATH  layer.lyrx" in out
+              and "could not be read" in out,
+              "findings still refuse with exit 1, and the unread file is named too")
+        check("and 1 more" in out,
+              "a long list of unread files is cut at five, and says how many "
+              "more there are")
 
         # ---- the installed hook, against real commits
         os.chdir(hookrepo)
@@ -1764,6 +2067,13 @@ def self_test():
         shutil.rmtree(tmp, ignore_errors=True)
         check(not os.path.isdir(tmp),
               "the self-test leaves no temporary directory behind  <-- pinned defect")
+        take_env()
+        os.environ.update(held)
+        check(dict((k, v) for k, v in os.environ.items()
+                   if k.startswith("GIT_") or k == "GDBFENCE_MAX_DATASET_SIZE")
+              == held,
+              "the caller's own GIT_ and GDBFENCE_ variables are put back "
+              "exactly  <-- pinned defect")
 
     print("-" * 68)
     total = passed[0] + len(failed)
@@ -1827,6 +2137,7 @@ def main(argv=None):
     if args.install:
         return install(os.path.basename(os.path.abspath(__file__)), args.apply)
 
+    unreadable = []
     if args.staged:
         entries = staged_entries()
         if entries is None:
@@ -1844,7 +2155,7 @@ def main(argv=None):
             print("error: no such file or directory: %s" % ", ".join(missing),
                   file=sys.stderr)
             return 64
-        entries = walk_entries(args.paths)
+        entries = walk_entries(args.paths, unreadable)
         source = "%d path(s) on the command line" % len(args.paths)
     else:
         print("error: pass paths to audit, or --staged. Use --self-test to "
@@ -1857,11 +2168,23 @@ def main(argv=None):
     for path, size in entries:
         if ignored(path, args.ignore):
             continue
-        text = document_text(path, size, args.staged)
+        text = document_text(path, size, args.staged, unreadable)
         if text is not None:
             findings.extend(scan_text(normalize(path), text))
 
+    # A clean pass over files nobody could read is not a clean pass. Findings
+    # that were made stand either way, so this only changes the empty case.
+    if unreadable:
+        shown = ", ".join(unreadable[:5])
+        if len(unreadable) > 5:
+            shown += ", and %d more" % (len(unreadable) - 5)
+        print("error: %d file(s) or folder(s) could not be read, so they were "
+              "not audited: %s" % (len(unreadable), shown), file=sys.stderr)
+
     if not findings:
+        if unreadable:
+            print("VERDICT: UNKNOWN, some files could not be read")
+            return 2
         print("VERDICT: CLEAN")
         return 0
 
@@ -1882,5 +2205,7 @@ def main(argv=None):
     return 1
 
 
+# ponytail: the False branch is taken only when this file is imported, which
+# a script run by coverage never does.
 if __name__ == "__main__":
     sys.exit(main())

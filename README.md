@@ -9,12 +9,12 @@ later. Nobody notices on the day, because nothing failed.
 
 Three commits earlier, somebody staged `roads.shp`, `roads.shx` and `roads.dbf` but not
 `roads.prj`. A shapefile with no `.prj` carries no CRS at all, so every checkout of it lands
-wherever the reader guesses. In ArcGIS Pro that is usually the Gulf of Mexico.
+wherever the reader guesses.
 
 Then a nightly script moves from an analyst's desk to a scheduled server. Its first call is
 `AddToolbox` on `ArcGIS\Desktop10.8\ArcToolbox\Toolboxes`, built from
 `os.environ["ProgramFiles(x86)"]`, so the line carries no drive letter. The server has ArcGIS
-Pro and no ArcMap. The next line is one `Append` call with a field map of 2,400 characters,
+Pro and no ArcMap. The next line is one `Append` call with a field map of more than 2,000 characters,
 and 26 of its input paths sit on two file shares. The old scan reported one share on that line
 and nothing at all on the `AddToolbox` line.
 
@@ -59,18 +59,25 @@ PASS  the installed hook REFUSES a commit carrying a .gdb
 PASS  the same hook lets a clean commit through  <-- pinned defect
 PASS  the self-test leaves no temporary directory behind  <-- pinned defect
 --------------------------------------------------------------------
-271 assertions, 0 failed
+319 assertions, 0 failed
 ```
+
+The block above is the real output with lines elided at the `...` marks. The pinned-defect lines for this
+upgrade sit in the elided part.
 
 ## Requirements
 
 Python 3.9 or newer. Nothing to install, no `arcpy`, no third-party package. It runs on ArcGIS
-Pro's Python and on a plain `python3` equally.
+Pro's Python and on a plain `python3` equally. The self-test passed with the same 319 assertions on
+Python 3.9, 3.12 and 3.13, on Windows and on Linux.
 
 `git` is needed for `--staged`, for `--install`, and for the read-only history check that prints
 the filter-repo command. Auditing paths on disk needs no repository at all. `--self-test` needs
-it too: its last seventy-nine assertions build a throwaway repository in a temporary directory, install
-the hook into it, and put real commits past it.
+it too: its last ninety-four assertions build a throwaway repository in a temporary directory, install
+the hook into it, and put real commits past it. For that run the self-test sets every `GIT_` variable
+and `GDBFENCE_MAX_DATASET_SIZE` aside, so that a `GIT_DIR` left by a git hook or `git rebase -x` cannot
+make it act on your repository, and it puts them back at the end. It also stops git's search for a
+repository at its own temporary directory, so a `TMPDIR` inside a work tree is safe.
 
 ```
 git clone https://github.com/uhsear/gdbfence.git
@@ -107,6 +114,17 @@ python gdbfence.py --install --apply    # writes .git/hooks/pre-commit
 `--install` also prints a `.pre-commit-config.yaml` entry, so a repository that already uses
 pre-commit can run this alongside `check-added-large-files` rather than instead of it.
 
+The entry names the interpreter that ran `--install`. pre-commit splits `entry` with
+`shlex.split` and runs the result with no shell (`hook_cmd` in its `pre_commit/lang_base.py`).
+Its [documentation](https://pre-commit.com/#new-hooks) says `entry` can carry arguments, but not how
+it is split, so the splitting is read from that source. An interpreter path with a space in it, such
+as ArcGIS Pro's default, is therefore written with forward slashes inside double quotes, and the
+whole value is single quoted for YAML. The self-test splits the printed entry the way pre-commit
+does and checks that the interpreter comes back as one word. pre-commit now calls
+`language: system` `unsupported`, and keeps `system` as an alias that its documentation says
+"will be removed in a future version". This tool still prints `system`, which older pre-commit
+releases need.
+
 | Flag | Default | What it does |
 |---|---|---|
 | `PATHS` | none | Files or directories to audit. Directories are walked. A path that does not exist is a usage error, not a clean audit. |
@@ -118,8 +136,9 @@ pre-commit can run this alongside `check-added-large-files` rather than instead 
 | `--apply` | off | Write the hook file. Without it nothing is written. |
 | `--self-test` | off | Run the assertions and exit. The io half needs `git` and a temporary directory. |
 
-Exit codes: 0 clean, 1 findings, 2 a git step, an install step or a flag value failed, 64 usage
-error. An unreadable `--max-dataset-size`, from the flag or from the environment variable, is
+Exit codes: 0 clean, 1 findings, 2 a git step, an install step or a flag value failed, or a file or
+folder could not be read and nothing else was found, 64 usage error. A file the run could not open
+is named on stderr and never counts as clean: the verdict is `UNKNOWN` and the exit code is 2. An unreadable `--max-dataset-size`, from the flag or from the environment variable, is
 argparse's own error and exits 2.
 
 ## What it refuses
@@ -130,19 +149,29 @@ argparse's own error and exits 2.
 - **An incomplete shapefile.** A `.shp` staged without `.shx`, `.dbf` or `.prj`. The report names
   the missing extensions and says what a missing `.prj` costs.
 - **A non-portable path** inside a text or CIM document: an absolute drive letter such as
-  `C:\GIS\parcels.gdb`, a UNC path such as `\\\gisfiles\parcels`, or an ArcCatalog connection
+  `C:\GIS\parcels.gdb`, a UNC path such as `\\gisfiles\parcels`, or an ArcCatalog connection
   folder path such as `Database Connections\prod.sde`, or a toolbox inside the ArcGIS install
-  tree. Inside a serialized field map it counts every input path, not just the first one on the
-  line. It reads `.lyrx`, `.mapx`, `.json`, `.py`, `.pyt`, `.yml`, `.xml`, `.sql` and a few
+  tree. Inside a serialized field map it counts the first input path of every entry, not just the
+  first one on the line. It reads `.lyrx`, `.mapx`, `.json`, `.py`, `.pyt`, `.yml`, `.xml`, `.sql` and a few
   more, and gives the line number for each one.
-- **Files that should essentially never be committed**: `.gdb`, `.sde`, `.lock`, `.mdb` and
-  `.gdbindexes`.
+- **Files that should essentially never be committed**: `.gdb`, `.sde`, `.mdb`, `.gdbindexes` and
+  an ArcGIS lock file. Esri's
+  [file geodatabase locking page](https://desktop.arcgis.com/en/arcmap/10.3/manage-data/administer-file-gdbs/file-geodatabases-and-locking.htm)
+  says ArcGIS places `*.lock` files in the geodatabase folder and gives `xxx.PLUTO.15332.sr.lock` as
+  an example, with the computer name inside. So a lock file is refused when `.sr`, `.rd`, `.wr`,
+  `.ed`, `.gdb`, `.mdb`, `.shp` or `.dbf` comes just before `.lock`. A bare `.lock` suffix is not
+  refused, because `Cargo.lock`, `poetry.lock` and `yarn.lock` belong in a repository. The page names
+  the `sr` lock; the `rd`, `wr` and `ed` types come from an Esri Community thread, not from a
+  documentation page.
 
 When a refused dataset is already in a commit, it prints the exact `git filter-repo` command that
 removes it, with any path that is not plainly safe double quoted so that a path with a space in it
 stays one argument. It prints the command and stops. That command rewrites every hash and forces
 every collaborator to re-clone, so the person who owns that decision is the person reading the
 output.
+
+For a shapefile set over the limit the command names each member file, `--path roads.dbf --path
+roads.prj` and so on, because the stem `roads` is not a path git knows.
 
 Only bloat and never-commit findings are offered to filter-repo. A shapefile missing its `.prj`
 is fixed by committing the `.prj`, and a hard-coded drive letter is fixed by editing the line.
@@ -185,15 +214,21 @@ the other half free to change with nothing going red.
 no UNC host, so the two patterns above structurally cannot see it, and a repository full of them
 scans clean. ArcGIS resolves that path against `%APPDATA%\ESRI\Desktop10.x\ArcCatalog` in
 one user profile. The build agent has no such folder, the service account has no such folder,
-and the job runs at the desk that wrote it and nowhere else. Measured over a 743-file legacy
-ArcGIS estate, 279 files name that folder, and 56 of them held a connection path that no other
-rule here reported. The folder name with no path separator after it stays silent, because that
+and the job runs at the desk that wrote it and nowhere else. In a legacy script estate many
+files name that folder, and some of them held a connection path that no other rule here reported. The folder name with no path separator after it stays silent, because that
 is prose about a feature and not a path.
 
 The UNC check had the same shape of bug, found by running it. A CIM document spells a relative
 path `"..\\data\\parcels.gdb"`, which contains `\\data\`, so the first pattern reported every
 portable layer file in the repository as non-portable. A UNC path now only counts at the start of
 a path, and two more assertions pin it.
+
+Git LFS is the mainstream answer to large binaries in a repository, and it is a different job. It
+moves the content out of the history behind a pointer file and needs a pattern for what to track.
+It does not know that a folder named `parcels.gdb` is one dataset, and it does not read a script for
+a drive letter. Use it for the dataset you do decide to version. A GitHub search with
+`gh search repos` on 2026-10-13, for the name and for geodatabase together with pre-commit, found no
+other tool with this job. That is a search, not proof.
 
 Credential scanning is deliberately absent. `gitleaks` and `detect-secrets` do that properly, and
 an `.sde` file with a saved password is caught here as an `.sde` file, not as a secret.
@@ -227,7 +262,21 @@ first path on a line and stops, so the second share in that string was never nam
 letter early in the string hid every share after it. Now each entry whose merge rule is one that
 the [FieldMap reference](https://doc.esri.com/en/arcgis-pro/latest/arcpy/classes/fieldmap.html)
 lists (First, Last, Join, Min, Max, Mean, Median, Sum, StDev, Count) has its input path judged
-alone. The line gets one finding that counts the paths under each root. Any path outside the
+alone. The line gets one finding that counts the paths under each root.
+
+A Join entry writes its delimiter in double quotes, and the delimiter can hold a comma. The shape
+below is the real output of `FieldMappings.exportToString` under ArcGIS Pro 3.6 with
+`joinDelimiter = ", "`, run against a synthetic table. The delimiter field used to stop at its
+first comma, so the Join entry was not read as a field map entry and the share behind it was
+never named. The FieldMap reference describes `joinDelimiter` as the string that separates input
+values from the same table.
+
+```
+NAME "NAME" true true false 50 Text 0 0,Join,", ",<path>,NAME,0,49,<path>,NAME,0,49
+```
+
+The pattern tries a quoted delimiter first, so `", "`, `","`, `";"` and the same text inside
+backslash-escaped quotes all read as a field map.  Any path outside the
 field map on that line is still judged by the ordinary rules.
 
 Before and after, on the synthetic script from the story at the top:
@@ -311,6 +360,47 @@ drive letter in prose is documentation. One in an assignment is the defect.
 - A shapefile whose sidecars disagree about the case of the name, `ROADS.SHP` beside `roads.prj`,
   is counted as two datasets and reported incomplete. Extensions are matched without regard to
   case; the name before the extension is not.
+
+- The install-tree rule needs a separator after `Toolboxes` inside one string, so a folder path that
+  ends at `Toolboxes` and is joined to the toolbox name later is not seen.
+- Any text that spells `ArcToolbox/Toolboxes/` is refused, even when the base comes from
+  `arcpy.GetInstallInfo()`, and even for a relative path such as `tools/ArcToolbox/Toolboxes/mine.tbx`
+  that is portable. The pattern has no word boundary, so `MyArcToolbox/Toolboxes/` also matches.
+  These are false refusals and never false passes. Waive the line with `# gdbfence: allow`. The
+  advice that the core toolboxes need no `AddToolbox` is printed for a match in a `.bat`, `.json` or
+  `.cfg` file too, where no `AddToolbox` call exists.
+- The `ArcGIS\Desktop10.x\ArcToolbox\Toolboxes` layout of ArcMap is not cited to Esri
+  documentation, and ArcMap is not installed here to check it. Only the Pro 3.6 layout was seen on
+  disk. The Esri pages cited above support the advice that the core toolboxes need no `AddToolbox`,
+  not the folder names.
+- Files saved as UTF-16 are skipped without a warning, so save scripts as UTF-8. A file with a NUL
+  byte and a text file over 4 MB (`TEXT_READ_LIMIT`) are skipped without a warning too. A file that
+  cannot be opened is different: it is named on stderr and the run cannot end clean.
+- Only the backslash spelling of a UNC path is recognised, inside a field map or outside one.
+- Notebooks, PowerShell and `.cmd` scripts are not scanned. Only the suffixes listed above are read.
+- A single letter, a colon and an escape, such as `A:\tvalue` or `Q:\n`, matches the drive-letter
+  rule in `.py`, `.json` and text files and is refused. Waive the line.
+- A field map input path with a comma or a semicolon in it is cut at that character, so its root can
+  be misjudged. A UNC path is still caught by the ordinary line rules, so the verdict stays REFUSE.
+- A field map entry with several inputs for one output field counts only its first input path.
+  Real Pro output lists the inputs back to back as `path,field,start,end` groups. Later paths in the
+  same entry are judged by the ordinary rules, which name one share per line, so the count in
+  "field map with N input path(s)" can be low. The verdict stays REFUSE.
+- An `--ignore` glob is matched against the path as written, so run from the repository root or pass
+  relative paths. `vendor/*` skips `vendor/x.shp` when the path is `.`, but not when the path is
+  absolute or a parent directory. The files are then still audited, which errs on the side of REFUSE.
+- Under `--staged`, a staged file whose name git cannot address by path is not audited. An example is
+  a name that git reads as a stage spec, such as `1:x.py`.
+- A reported path with a character outside the console code page, such as a Greek letter, can crash
+  the report on Windows when output is piped. The traceback exits 1, the same code as findings. Set
+  `PYTHONIOENCODING=utf-8`.
+- The printed `git filter-repo` command is not safe to paste into a POSIX shell when a path contains
+  `$` or a backtick, because it is double quoted. Read the paths first. A path with a double quote
+  stops the run with a traceback after the findings print, and exit code 1.
+- Branch coverage of the self-test is 98% (`coverage run --branch gdbfence.py --self-test`, coverage
+  7.16.1). Each unreached line carries a `ponytail:` comment that names why: a defensive guard no input
+  reached, the other operating system's branch, a failing-run report, the restore of an environment
+  variable a developer set, and the `__main__` guard when the file is imported.
 
 ## Contributing
 
